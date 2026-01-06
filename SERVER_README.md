@@ -1,6 +1,6 @@
 # ENCODE fastmcp Server
 
-A fastmcp server exposing the ENCODE library functionality on `http://127.0.0.1:8080`.
+A fastmcp server exposing the ENCODE library functionality on `http://0.0.0.0:8080`.
 
 ## Features
 
@@ -334,6 +334,89 @@ The server automatically uses two levels of caching:
    - Hierarchically organized by experiment type prefix
    - Caches individual experiment metadata and file information
    - Auto-populated as experiments are accessed
+
+## Testing
+
+The server includes a comprehensive MCP protocol test suite in `tests/test_mcp_server.py` that validates all core functionality.
+
+### Running Tests
+
+First, install test dependencies:
+
+```bash
+pip install pytest requests
+```
+
+Then run the tests against your server:
+
+```bash
+# Test against local server (default)
+pytest tests/test_mcp_server.py -v
+
+# Test against a remote server
+MCP_SERVER_URL=http://YOURMCPSERVERIP:8080/mcp pytest tests/test_mcp_server.py -v
+
+# Quiet mode with summary
+pytest tests/test_mcp_server.py -q
+```
+
+### Test Coverage
+
+The test suite validates:
+
+- ✅ **MCP Protocol Compliance** — Proper JSON-RPC 2.0 request/response handling
+- ✅ **Session Management** — Session initialization and ID handling via MCP headers
+- ✅ **Tool Execution** — Core tools (`get_server_info`, `list_experiments`, `get_experiment`, `search_by_biosample`)
+- ✅ **Response Parsing** — Server-Sent Events (SSE) response format and result extraction
+- ✅ **Data Integrity** — Returned metadata contains required fields (accession, organism, assay, biosample)
+- ✅ **Error Handling** — Graceful handling of invalid accessions and server errors
+
+### Test Details
+
+**Included Test Cases:**
+
+1. `test_tool_basic_responses[get_server_info]` — Validates server metadata (name, version, port)
+2. `test_tool_basic_responses[list_experiments]` — Checks experiment list pagination and structure
+3. `test_get_experiment_by_accession[ENCSR000CDC]` — Retrieves a known experiment and validates fields
+4. `test_get_experiment_by_accession[ENCSR000AAA]` — Tests alternate accession lookup
+5. `test_search_by_biosample_returns_list` — Validates K562 biosample search returns list format
+6. `test_server_health_check_get` — Basic server availability check
+
+### Test Results Example
+
+```
+pytest tests/test_mcp_server.py -q
+.....s                                                                                                [100%]
+5 passed, 1 skipped in 0.94s
+```
+
+- **5 passed**: Core MCP protocol tests pass
+- **1 skipped**: GET endpoint not required (POST is primary MCP method)
+
+### MCP Protocol Details (for debugging)
+
+The test suite demonstrates proper MCP HTTP transport:
+
+1. **Initialize session** with `protocolVersion`, `capabilities`, and `clientInfo`
+2. **Extract session ID** from response header: `mcp-session-id`
+3. **Send tool calls** with session ID in request headers
+4. **Parse SSE responses** in `data: {...}` format
+5. **Extract results** from `result.content[0].text` wrapper
+
+Example initialization (for reference):
+
+```python
+payload = {
+    "jsonrpc": "2.0",
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2024-11-05",
+        "capabilities": {},
+        "clientInfo": {"name": "client", "version": "1.0"}
+    },
+    "id": 1,
+}
+```
 
 ## Performance Notes
 
