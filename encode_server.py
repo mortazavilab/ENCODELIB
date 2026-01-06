@@ -584,7 +584,7 @@ def get_server_info() -> dict:
         "server_name": "ENCODE fastmcp Server",
         "version": "1.0.0",
         "port": 8080,
-        "host": "127.0.0.1",
+        "host": "0.0.0.0",
         "work_dir": str(WORK_DIR),
         "cache_dir": str(CACHE_DIR),
         "files_dir": str(FILES_DIR),
