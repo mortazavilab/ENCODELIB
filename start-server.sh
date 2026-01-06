@@ -43,7 +43,7 @@ echo -e "${GREEN}✓ Cache directory: $(pwd)/.encode_cache${NC}"
 echo -e "${GREEN}✓ Files directory: $(pwd)/files${NC}"
 echo ""
 
-echo -e "${BLUE}Starting server on http://127.0.0.1:8080${NC}"
+echo -e "${BLUE}Starting server on http://0.0.0.0:8080${NC}"
 echo ""
 
 # Run the server

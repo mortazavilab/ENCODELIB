@@ -3,7 +3,7 @@
 ENCODE fastmcp Server
 
 A fastmcp server exposing ENCODE library functionality.
-Runs on http://127.0.0.1:8080
+Runs on http://0.0.0.0:8080
 
 Usage:
     fastmcp run encode_server.py
@@ -598,5 +598,5 @@ if __name__ == "__main__":
     logger.info(f"Files directory: {FILES_DIR}")
     logger.info("Server running on stdio transport for MCP clients")
     
-    # Run the fastmcp server (stdio transport)
-    server.run(transport="http", host="127.0.0.1", port=8080)
+    # Run the fastmcp server on HTTP
+    server.run(transport="http", host=".0.0.0", port=8080)
