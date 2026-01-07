@@ -3,44 +3,60 @@ import requests
 import json
 import os
 import uuid
+import sys
+import argparse
 from datetime import datetime
 
 # ==========================================
-# ⚙️ GLOBAL CONSTANTS
+# ⚙️ CONFIGURATION & CLI PARSING
 # ==========================================
 SESSION_FILE = "chat_sessions.json"
 SETTINGS_FILE = "settings.json"
-DEFAULT_SERVER_IP = "128.200.7.223"
+DEFAULT_IP = "127.0.0.1" # Safe local default
 MODEL_CHOICES = ["devstral-small-2:latest", "mistral:latest", "llama3.1:latest"]
+
+def get_cli_args():
+    """Parses command line arguments passed after '--'."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ip", type=str, help="Initial Server IP address")
+    # Streamlit passes its own args, so we parse known args and ignore others
+    args, _ = parser.parse_known_args()
+    return args
 
 st.set_page_config(page_title="ENCODE Analyst", layout="wide", page_icon="🧬")
 
 # ==========================================
-# 💾 SETTINGS MANAGER (Servers)
+# 💾 SETTINGS MANAGER
 # ==========================================
 
 def load_settings():
-    """Loads server settings from disk."""
-    default_settings = {
-        "servers": [
-            {"name": "Watson Cluster", "ip": "128.200.7.223"},
-            {"name": "Localhost", "ip": "127.0.0.1"}
-        ],
-        "active_server_ip": "128.200.7.223"
+    """Loads settings, prioritizing CLI args first, then disk, then defaults."""
+    cli_args = get_cli_args()
+    
+    # Base defaults
+    settings = {
+        "servers": [{"name": "Localhost", "ip": "127.0.0.1"}],
+        "active_server_ip": DEFAULT_IP
     }
     
-    if not os.path.exists(SETTINGS_FILE):
-        return default_settings
+    # Load from disk if exists
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                disk_settings = json.load(f)
+                settings.update(disk_settings)
+        except:
+            pass
+
+    # CLI Override (Ephemeral override, doesn't save to disk immediately unless user acts)
+    if cli_args.ip:
+        # Check if this IP exists in known servers, if not add it temp
+        known_ips = [s["ip"] for s in settings["servers"]]
+        if cli_args.ip not in known_ips:
+            settings["servers"].insert(0, {"name": f"CLI Server ({cli_args.ip})", "ip": cli_args.ip})
+        settings["active_server_ip"] = cli_args.ip
         
-    try:
-        with open(SETTINGS_FILE, "r") as f:
-            data = json.load(f)
-            # Ensure structure is valid
-            if "servers" not in data or "active_server_ip" not in data:
-                return default_settings
-            return data
-    except:
-        return default_settings
+    return settings
 
 def save_settings(settings):
     """Writes settings to disk."""
@@ -48,9 +64,15 @@ def save_settings(settings):
         json.dump(settings, f, indent=2)
 
 def get_active_urls():
-    """Returns the MCP and OLLAMA URLs based on current settings."""
-    settings = load_settings()
-    ip = settings.get("active_server_ip", DEFAULT_SERVER_IP)
+    """Constructs URLs dynamically based on current session state or settings."""
+    # Use session state if available (real-time switching), else load from disk
+    if "active_server_ip" in st.session_state:
+        ip = st.session_state.active_server_ip
+    else:
+        settings = load_settings()
+        ip = settings["active_server_ip"]
+        st.session_state.active_server_ip = ip # Sync state
+        
     return {
         "mcp": f"http://{ip}:8080/mcp",
         "ollama": f"http://{ip}:11434/api/chat",
@@ -221,7 +243,7 @@ def chat_with_ollama(model, messages, tools=None):
 # 🖥️ STREAMLIT UI & SIDEBAR
 # ==========================================
 
-# 1. Initialize Session
+# 1. Initialize State
 if "active_session_id" not in st.session_state:
     existing = load_all_sessions()
     if existing:
@@ -229,6 +251,13 @@ if "active_session_id" not in st.session_state:
         st.session_state.messages = existing[st.session_state.active_session_id]["messages"]
     else:
         create_new_session()
+
+# Load Settings (CLI > Disk)
+if "settings_loaded" not in st.session_state:
+    settings = load_settings()
+    st.session_state.active_server_ip = settings["active_server_ip"]
+    st.session_state.server_list = settings["servers"]
+    st.session_state.settings_loaded = True
 
 # 2. Sidebar
 with st.sidebar:
@@ -260,54 +289,59 @@ with st.sidebar:
     # --- SERVER SETTINGS UI ---
     st.header("⚙️ Server Settings")
     
-    current_settings = load_settings()
-    server_list = current_settings["servers"]
-    active_ip = current_settings["active_server_ip"]
-    
     # Dropdown for Active Server
-    server_names = [s["name"] for s in server_list]
-    active_name = next((s["name"] for s in server_list if s["ip"] == active_ip), server_names[0])
+    server_list = st.session_state.server_list
+    active_ip = st.session_state.active_server_ip
     
-    selected_server_name = st.selectbox("Active Server", server_names, index=server_names.index(active_name))
+    server_names = [s["name"] for s in server_list]
+    
+    # Determine index, default to first if active IP not found
+    try:
+        active_name = next((s["name"] for s in server_list if s["ip"] == active_ip), server_names[0])
+        idx = server_names.index(active_name)
+    except:
+        idx = 0
+        
+    selected_server_name = st.selectbox("Active Server", server_names, index=idx)
     
     # Handle Server Switch
     new_ip = next((s["ip"] for s in server_list if s["name"] == selected_server_name), active_ip)
+    
     if new_ip != active_ip:
-        current_settings["active_server_ip"] = new_ip
-        save_settings(current_settings)
-        # Reset connection session on switch
-        if "mcp_session_id" in st.session_state:
-            del st.session_state.mcp_session_id
+        st.session_state.active_server_ip = new_ip
+        # Save to disk
+        save_settings({"servers": server_list, "active_server_ip": new_ip})
+        # Reset connection
+        if "mcp_session_id" in st.session_state: del st.session_state.mcp_session_id
         st.success(f"Switched to {selected_server_name}")
         st.rerun()
 
     # Expandable Manager
     with st.expander("Manage Servers"):
         st.caption("Add a new MCP server connection.")
-        new_svr_name = st.text_input("Name", placeholder="My GPU Server")
-        new_svr_ip = st.text_input("IP Address", placeholder="192.168.1.50")
+        new_svr_name = st.text_input("Name", placeholder="Remote GPU")
+        new_svr_ip = st.text_input("IP Address", placeholder="128.200.7.223")
         
         if st.button("Add Server"):
             if new_svr_name and new_svr_ip:
-                current_settings["servers"].append({"name": new_svr_name, "ip": new_svr_ip})
-                save_settings(current_settings)
+                server_list.insert(0, {"name": new_svr_name, "ip": new_svr_ip})
+                st.session_state.server_list = server_list
+                st.session_state.active_server_ip = new_svr_ip
+                save_settings({"servers": server_list, "active_server_ip": new_svr_ip})
                 st.rerun()
         
-        if st.button("🗑️ Remove Selected Server"):
+        if st.button("🗑️ Remove Selected"):
             if len(server_list) > 1:
-                current_settings["servers"] = [s for s in server_list if s["name"] != selected_server_name]
-                # Default to first if active was deleted
-                if selected_server_name == active_name:
-                    current_settings["active_server_ip"] = current_settings["servers"][0]["ip"]
-                save_settings(current_settings)
+                st.session_state.server_list = [s for s in server_list if s["name"] != selected_server_name]
+                st.session_state.active_server_ip = st.session_state.server_list[0]["ip"]
+                save_settings({"servers": st.session_state.server_list, "active_server_ip": st.session_state.active_server_ip})
                 st.rerun()
             else:
-                st.error("Cannot delete the last server.")
+                st.error("Cannot delete last server.")
 
     st.divider()
     st.subheader("Chat Options")
     
-    # Rename Current Chat
     current_name = all_sessions[st.session_state.active_session_id]["name"]
     new_name = st.text_input("Rename Chat", value=current_name)
     if new_name != current_name:
@@ -323,7 +357,7 @@ with st.sidebar:
 st.title("🧬 ENCODE Analyst")
 active_urls = get_active_urls()
 
-# Auto-connect
+# Auto-connect if history empty
 if not st.session_state.messages:
     with st.spinner(f"Connecting to {active_urls['ip']}..."):
         if get_mcp_session():
@@ -334,8 +368,10 @@ if not st.session_state.messages:
                     welcome += f"- **`{t['name']}`**: {t.get('description','').splitlines()[0]}\n"
                 st.session_state.messages.append({"role": "assistant", "content": welcome})
                 save_current_interaction()
+        else:
+            st.session_state.messages.append({"role": "assistant", "content": f"⚠️ **Connection Failed**: Could not reach {active_urls['ip']}."})
 
-# Display
+# Display Messages
 for msg in st.session_state.messages:
     if msg["role"] == "user":
         with st.chat_message("user"): st.markdown(msg["content"])
