@@ -53,7 +53,6 @@ def mcp_rpc_call(method, params=None):
         resp = requests.post(MCP_SERVER_URL, json=payload, headers=headers, timeout=60)
         resp.raise_for_status()
         
-        # Parse potential SSE data
         lines = resp.text.strip().split("\n")
         for line in lines:
             if line.strip().startswith("data:"):
@@ -78,7 +77,7 @@ def extract_raw_result(rpc_response):
     return result
 
 # ==========================================
-# 🛠️ OLLAMA HELPER (THE FIX)
+# 🛠️ OLLAMA HELPER
 # ==========================================
 
 def get_available_tools_schema():
@@ -99,61 +98,30 @@ def get_available_tools_schema():
     return ollama_tools, mcp_tools
 
 def sanitize_messages_for_ollama(messages):
-    """
-    CRITICAL FIX: Cleans the Streamlit history into a format Ollama accepts.
-    1. Converts 'tool_result' (UI role) to 'tool' (API role).
-    2. Stringifies JSON content (API expects strings).
-    3. Removes UI-specific keys like 'avatar' or 'name'.
-    """
+    """Cleans history for Ollama API (converts objects to strings, fixes roles)."""
     clean = []
     for msg in messages:
-        # 1. Handle Standard Roles (user, assistant)
         if msg["role"] in ["user", "assistant", "system"]:
-            new_m = {
-                "role": msg["role"],
-                "content": msg.get("content", "") or "" # Ensure content is string, not None
-            }
-            # Only attach tool_calls if they exist
-            if msg.get("tool_calls"):
-                new_m["tool_calls"] = msg["tool_calls"]
+            new_m = {"role": msg["role"], "content": msg.get("content", "") or ""}
+            if msg.get("tool_calls"): new_m["tool_calls"] = msg["tool_calls"]
             clean.append(new_m)
-            
-        # 2. Handle Tool Results (The part that was breaking)
         elif msg["role"] == "tool_result":
             content_val = msg["content"]
-            # Ollama requires tool output to be a STRING
-            if not isinstance(content_val, str):
-                content_val = json.dumps(content_val)
-                
-            clean.append({
-                "role": "tool",
-                "content": content_val
-            })
+            if not isinstance(content_val, str): content_val = json.dumps(content_val)
+            clean.append({"role": "tool", "content": content_val})
     return clean
 
 def chat_with_ollama(model, messages, tools=None):
-    # Sanitize inputs before sending
     clean_history = sanitize_messages_for_ollama(messages)
-    
-    payload = {
-        "model": model,
-        "messages": clean_history,
-        "stream": False
-    }
-    if tools:
-        payload["tools"] = tools
+    payload = {"model": model, "messages": clean_history, "stream": False}
+    if tools: payload["tools"] = tools
 
     try:
         res = requests.post(OLLAMA_URL, json=payload)
         res.raise_for_status()
         return res.json()["message"]
-    except requests.exceptions.HTTPError as e:
-        # Debugging: Print exactly what we sent if it fails
-        st.error(f"HTTP 400 Error. Check Console for payload.")
-        print("FAILED PAYLOAD:", json.dumps(payload, indent=2)) 
-        return {"role": "assistant", "content": f"⚠️ LLM Error: {str(e)}"}
     except Exception as e:
-        return {"role": "assistant", "content": f"⚠️ System Error: {str(e)}"}
+        return {"role": "assistant", "content": f"⚠️ LLM Error: {str(e)}"}
 
 # ==========================================
 # 🖥️ STREAMLIT UI
@@ -192,9 +160,10 @@ for msg in st.session_state.messages:
                 for tc in msg["tool_calls"]:
                     st.code(f"🛠️ Tool Call: {tc['function']['name']}", language="text")
     elif msg["role"] == "tool_result":
+        # 🔽 THIS IS THE CHANGE FOR HISTORY 🔽
         with st.chat_message("assistant", avatar="📦"):
-            st.markdown(f"**Raw Output from `{msg.get('name')}`:**")
-            st.json(msg["content"])
+            with st.expander(f"📦 Raw Output: {msg.get('name')}", expanded=False):
+                st.json(msg["content"])
 
 # Input Loop
 if prompt := st.chat_input("Ex: 'Search for human lung experiments'"):
@@ -227,19 +196,19 @@ if prompt := st.chat_input("Ex: 'Search for human lung experiments'"):
                     raw_res = mcp_rpc_call("tools/call", {"name": fn_name, "arguments": fn_args})
                     data = extract_raw_result(raw_res)
                 
-                # Show JSON
+                # 🔽 THIS IS THE CHANGE FOR LIVE EXECUTION 🔽
                 with st.chat_message("assistant", avatar="📦"):
-                    st.markdown(f"**Raw Output from `{fn_name}`:**")
-                    st.json(data)
+                    with st.expander(f"📦 Raw Output: {fn_name}", expanded=False):
+                        st.json(data)
                 
-                # Store in History (Python Object for UI)
+                # Store in History
                 st.session_state.messages.append({
                     "role": "tool_result",
                     "name": fn_name,
                     "content": data
                 })
             
-            # 3. Summarize (The fix in 'chat_with_ollama' handles the history conversion now)
+            # 3. Summarize
             with st.spinner("Analyzing..."):
                 final_res = chat_with_ollama(selected_model, st.session_state.messages)
             
