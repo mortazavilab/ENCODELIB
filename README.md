@@ -21,6 +21,9 @@
 - `SERVER_README.md` — Server-specific README with endpoints, tools and troubleshooting.
 
 ---
+## 🧩 Client (Streamlit) 📱
+
+The repository includes a Streamlit-based client `encodeStream.py` (interactive UI and LLM-assisted workflow). Full client documentation and running instructions are available in `CLIENT_README.md`.
 
 ## ⚙️ Installation & prerequisites
 
@@ -80,32 +83,8 @@ The server exposes tools such as `search_by_biosample`, `search_by_target`, `get
 - Metadata is cached per-experiment (hierarchical structure) to speed repeat operations.
 - Downloaded files are stored under `./files/{accession}/`.
 
----
-
-## 🧪 Development & contributions
-
-- Add issues or pull requests for bugs or features.
-- Follow established code style and add tests where appropriate.
-
-> If you want to add or change server tools, decorate functions in `encode_server.py` with `@server.tool()` (see `SERVER_README.md` for examples).
-
----
-
-## ⚠️ Missing items to consider
-- Consider adding a `requirements-client.txt` for the Streamlit client.
-- Client documentation: see `CLIENT_README.md` for how to run the Streamlit client and configuration notes.
-
-
-## Contact
-
-For questions about the implementation or API, see the docs in `encodeLib.md` or open an issue in this repository.
 
 
 ## 📜 License ✅
 
 This project is licensed under the **MIT License**. See the `LICENSE` file for the full license text.
-
-
-## 🧩 Client (Streamlit) 📱
-
-The repository includes a Streamlit-based client `encodeStream.py` (interactive UI and LLM-assisted workflow). Full client documentation and running instructions are available in `CLIENT_README.md`.
