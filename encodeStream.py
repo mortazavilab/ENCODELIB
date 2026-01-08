@@ -408,8 +408,8 @@ with st.sidebar:
         st.rerun()
 
     with st.expander("Manage Servers"):
-        new_svr_name = st.text_input("Name", placeholder="Remote GPU")
-        new_svr_ip = st.text_input("IP Address", placeholder="128.200.7.223")
+        new_svr_name = st.text_input("Name", placeholder="Remote Server")
+        new_svr_ip = st.text_input("IP Address", placeholder="127.0.0.1")
         
         if st.button("Add Server"):
             if new_svr_name and new_svr_ip:
