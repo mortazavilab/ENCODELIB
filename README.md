@@ -92,7 +92,8 @@ The server exposes tools such as `search_by_biosample`, `search_by_target`, `get
 ---
 
 ## ⚠️ Missing items to consider
-
+- Consider adding a `requirements-client.txt` for the Streamlit client.
+- Client documentation: see `CLIENT_README.md` for how to run the Streamlit client and configuration notes.
 
 
 ## Contact
@@ -105,4 +106,6 @@ For questions about the implementation or API, see the docs in `encodeLib.md` or
 This project is licensed under the **MIT License**. See the `LICENSE` file for the full license text.
 
 
-Thanks — this README is intended as a concise entry point; tell me if you want a longer README with badges, CI instructions, or an explicit `requirements-server.txt` file added. ✅
+## 🧩 Client (Streamlit) 📱
+
+The repository includes a Streamlit-based client `encodeStream.py` (interactive UI and LLM-assisted workflow). Full client documentation and running instructions are available in `CLIENT_README.md`.

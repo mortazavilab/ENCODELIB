@@ -7,6 +7,9 @@ from pathlib import Path
 from datetime import datetime
 
 
+__version__ = "0.2"
+
+
 class encodeExperiment:
     """Represents a single ENCODE experiment with its metadata."""
     

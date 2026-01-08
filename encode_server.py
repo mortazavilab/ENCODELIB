@@ -17,6 +17,9 @@ from fastmcp import FastMCP
 
 from encodeLib import ENCODE, encodeExperiment
 
+
+__version__ = "0.2"
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -582,7 +585,7 @@ def get_server_info() -> dict:
     """
     return {
         "server_name": "ENCODE fastmcp Server",
-        "version": "1.0.0",
+        "version": __version__,
         "port": 8080,
         "host": "0.0.0.0",
         "work_dir": str(WORK_DIR),
