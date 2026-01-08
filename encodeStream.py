@@ -7,7 +7,6 @@ import argparse
 import pandas as pd
 from datetime import datetime
 
-
 __version__ = "0.2"
 
 # ==========================================
