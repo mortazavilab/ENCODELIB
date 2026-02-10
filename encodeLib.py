@@ -41,6 +41,9 @@ class encodeExperiment:
         self.description = None
         self.replicate_count = 0
         
+        # Cache for files_by_type to avoid redundant parsing
+        self._files_by_type_cache = None
+        
         # Load and extract metadata
         self._load_data()
         if self.experiment_data:
@@ -77,6 +80,7 @@ class encodeExperiment:
         url = f"https://www.encodeproject.org/experiments/{self.accession}/"
         try:
             response = requests.get(url, params={"format": "json"}, timeout=30)
+            response.raise_for_status()
             self.experiment_data = response.json()
             # Cache the fetched data
             if self.encode_obj:
@@ -99,6 +103,8 @@ class encodeExperiment:
             response = requests.get(url, params={"format": "json", "frame": "embedded"}, timeout=30)
             response.raise_for_status()
             self.experiment_data = response.json()
+            # Clear the files cache since we have new data
+            self._files_by_type_cache = None
             # Cache the full data
             if self.encode_obj:
                 self.encode_obj._save_experiment_metadata(self.accession, self.experiment_data)
@@ -313,6 +319,11 @@ class encodeExperiment:
             ...
           }
         """
+        # Return cached result if available and no filters applied
+        cache_key = (after_date, file_status)
+        if self._files_by_type_cache is not None and self._files_by_type_cache[0] == cache_key:
+            return self._files_by_type_cache[1]
+        
         # Ensure we have full experiment data with files
         self._ensure_full_data()
         
@@ -376,6 +387,9 @@ class encodeExperiment:
                 files_by_type[file_type] = []
             
             files_by_type[file_type].append(file_metadata)
+        
+        # Cache the result
+        self._files_by_type_cache = (cache_key, files_by_type)
         
         return files_by_type
     
@@ -711,6 +725,13 @@ class encodeExperiment:
                 skipped.append(accession or 'unknown')
                 continue
             
+            # Sanitize filename to prevent path traversal
+            # Remove any directory components and only keep the base filename
+            filename = os.path.basename(filename)
+            if not filename or filename.startswith('.') or '/' in filename or '\\' in filename:
+                failed.append((accession, "Invalid or unsafe filename"))
+                continue
+            
             file_path = output_path / filename
             
             # Check if file already exists
@@ -736,12 +757,15 @@ class encodeExperiment:
                 response.raise_for_status()
                 
                 file_size = 0
-                with open(file_path, 'wb') as f:
+                temp_path = output_path / f"{filename}.tmp"
+                with open(temp_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                             file_size += len(chunk)
                 
+                # Rename temp file to final name only after successful download
+                temp_path.rename(file_path)
                 downloaded.append(accession)
                 print(f" DONE ({file_size:,} bytes)")
                 
@@ -749,7 +773,9 @@ class encodeExperiment:
                 failed.append((accession, str(e)))
                 print(f" FAILED ({e})")
                 # Remove partially downloaded file
-                if file_path.exists():
+                if 'temp_path' in locals() and temp_path.exists():
+                    temp_path.unlink()
+                elif file_path.exists():
                     file_path.unlink()
         
         # Print summary
@@ -828,6 +854,7 @@ class ENCODE:
         print("(This may take a minute...)\n")
         
         response = requests.get(self.url, params=self.query_params, timeout=120)
+        response.raise_for_status()
         data = response.json()
         
         experiments = data.get('@graph', [])
@@ -1131,13 +1158,10 @@ class ENCODE:
         if experiments_list is None:
             experiments_list = self.experiments
         
-        if search_term:
-            search_lower = search_term.lower()
+        search_lower = search_term.lower() if search_term else None
         matching = []
         
-        assay_lower = None
-        if assay_title:
-            assay_lower = assay_title.lower()
+        assay_lower = assay_title.lower() if assay_title else None
 
         for exp in experiments_list:
             # Skip revoked experiments if requested
@@ -1149,12 +1173,12 @@ class ENCODE:
                 continue           
 
             # Filter by search term if specified
-            if search_term:
+            if search_lower:
                 biosample_summary = exp.get('biosample_summary', '').lower()
                 term_name = exp.get('biosample_ontology', {}).get('term_name', '').lower()
             
                 # Check if biosample matches
-                if search_term and not (search_lower in biosample_summary or search_lower in term_name):
+                if not (search_lower in biosample_summary or search_lower in term_name):
                     continue
             
             # Filter by assay type if specified
@@ -1281,8 +1305,9 @@ class ENCODE:
             
             # Filter by assay type if specified
             if assay_title:
-                exp_assay = exp.get('assay_title', '')
-                if exp_assay != assay_title:
+                exp_assay = exp.get('assay_title', '').lower()
+                assay_lower = assay_title.lower()
+                if exp_assay != assay_lower:
                     continue
             
             matching.append(exp)

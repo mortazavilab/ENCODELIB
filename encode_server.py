@@ -602,4 +602,4 @@ if __name__ == "__main__":
     logger.info("Server running on stdio transport for MCP clients")
     
     # Run the fastmcp server on HTTP
-    server.run(transport="http", host=".0.0.0", port=8080)
+    server.run(transport="http", host="0.0.0.0", port=8080)
