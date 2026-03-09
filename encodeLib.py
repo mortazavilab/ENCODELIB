@@ -1,19 +1,85 @@
-import requests
-import pandas as pd
-from urllib.parse import urljoin
+from __future__ import annotations
+
 import json
+import logging
 import os
-from pathlib import Path
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+import pandas as pd
+import requests
 
 
-__version__ = "0.2"
+__version__ = "0.3"
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# HTTP helper with retry + exponential backoff
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MAX_RETRIES = 3
+_DEFAULT_BACKOFF_BASE = 1  # seconds
+
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _request_with_retry(
+    url: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+    timeout: int = 30,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+    stream: bool = False,
+) -> requests.Response:
+    """HTTP GET with exponential-backoff retry on transient failures.
+
+    Retries on ``ConnectionError``, ``Timeout``, and HTTP 429 / 5xx.
+    Client errors (4xx other than 429) are **not** retried.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, params=params, timeout=timeout, stream=stream)
+            if response.status_code in _RETRYABLE_STATUS_CODES and attempt < max_retries:
+                wait = _DEFAULT_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(
+                    "Retryable HTTP %s from %s – retry %d/%d in %.1fs",
+                    response.status_code, url, attempt, max_retries, wait,
+                )
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                wait = _DEFAULT_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning(
+                    "%s for %s – retry %d/%d in %.1fs",
+                    type(exc).__name__, url, attempt, max_retries, wait,
+                )
+                time.sleep(wait)
+            else:
+                raise
+        except requests.exceptions.HTTPError:
+            raise  # non-retryable HTTP errors bubble immediately
+    # Should not be reached, but satisfy type checkers
+    raise last_exc  # type: ignore[misc]
 
 
 class encodeExperiment:
     """Represents a single ENCODE experiment with its metadata."""
     
-    def __init__(self, accession=None, encode_obj=None, experiment_data=None):
+    def __init__(
+        self,
+        accession: Optional[str] = None,
+        encode_obj: Optional[Any] = None,
+        experiment_data: Optional[dict[str, Any]] = None,
+    ) -> None:
         """
         Initialize an encodeExperiment object.
         
@@ -49,8 +115,8 @@ class encodeExperiment:
         if self.experiment_data:
             self._extract_metadata()
     
-    def _load_data(self):
-        """Load experiment data if not already provided"""
+    def _load_data(self) -> None:
+        """Load experiment data if not already provided."""
         if self.experiment_data:
             # Data already provided in constructor
             if not self.accession and 'accession' in self.experiment_data:
@@ -79,8 +145,7 @@ class encodeExperiment:
         # Fetch from API if not found in loaded experiments
         url = f"https://www.encodeproject.org/experiments/{self.accession}/"
         try:
-            response = requests.get(url, params={"format": "json"}, timeout=30)
-            response.raise_for_status()
+            response = _request_with_retry(url, params={"format": "json"}, timeout=30)
             self.experiment_data = response.json()
             # Cache the fetched data
             if self.encode_obj:
@@ -88,7 +153,7 @@ class encodeExperiment:
         except Exception as e:
             raise ValueError(f"Could not load experiment {self.accession}: {e}")
     
-    def _fetch_full_data(self):
+    def _fetch_full_data(self) -> bool:
         """
         Fetch full experiment data from ENCODE API to ensure files are included.
         This is necessary because the cached experiments list may not include the files array.
@@ -100,8 +165,7 @@ class encodeExperiment:
         url = f"https://www.encodeproject.org/experiments/{self.accession}/"
         try:
             # Use frame=embedded to get nested objects like files
-            response = requests.get(url, params={"format": "json", "frame": "embedded"}, timeout=30)
-            response.raise_for_status()
+            response = _request_with_retry(url, params={"format": "json", "frame": "embedded"}, timeout=30)
             self.experiment_data = response.json()
             # Clear the files cache since we have new data
             self._files_by_type_cache = None
@@ -112,7 +176,7 @@ class encodeExperiment:
         except Exception as e:
             raise ValueError(f"Could not fetch experiment {self.accession}: {e}")
     
-    def _ensure_full_data(self):
+    def _ensure_full_data(self) -> None:
         """
         Ensure we have full experiment data including files with embedded objects.
         Fetches from API if files are not present or not fully embedded in current data.
@@ -141,8 +205,8 @@ class encodeExperiment:
         if needs_fetch:
             self._fetch_full_data()
     
-    def _extract_metadata(self):
-        """Extract relevant metadata from experiment data"""
+    def _extract_metadata(self) -> None:
+        """Extract relevant metadata from experiment data."""
         if not self.experiment_data:
             return
         
@@ -179,7 +243,7 @@ class encodeExperiment:
         # Replicate count
         self.replicate_count = len(self.experiment_data.get('replicates', []))
     
-    def _get_organism(self):
+    def _get_organism(self) -> Optional[str]:
         """Extract organism if encode_obj not available"""
         if 'replicates' not in self.experiment_data or not self.experiment_data['replicates']:
             return None
@@ -193,7 +257,7 @@ class encodeExperiment:
                         return biosample['organism'].get('scientific_name')
         return None
     
-    def _get_targets(self):
+    def _get_targets(self) -> list[str]:
         """Extract target(s) from experiment data"""
         target_field = self.experiment_data.get('target', None)
         
@@ -223,7 +287,7 @@ class encodeExperiment:
         
         return []
     
-    def __str__(self):
+    def __str__(self) -> str:
         """Return a formatted string representation of the experiment"""
         target_str = ', '.join(self.targets) if self.targets else 'None'
         lines = [
@@ -243,11 +307,11 @@ class encodeExperiment:
         ]
         return "\n".join(lines)
     
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Return a developer-friendly representation"""
         return f"encodeExperiment(accession='{self.accession}')"
     
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """Return metadata as a dictionary"""
         return {
             'Accession': self.accession,
@@ -262,7 +326,7 @@ class encodeExperiment:
             'Link': self.link
         }
     
-    def get_all_metadata(self):
+    def get_all_metadata(self) -> dict[str, Any]:
         """
         Get all available metadata for this experiment from the ENCODE API.
         
@@ -278,7 +342,7 @@ class encodeExperiment:
         
         return self.experiment_data
     
-    def get_files_by_type(self, after_date=None, file_status='released'):
+    def get_files_by_type(self, after_date: Optional[str] = None, file_status: str = 'released') -> dict[str, list[dict[str, Any]]]:
         """
         Get all files from this experiment organized by file type with comprehensive metadata.
         
@@ -393,7 +457,7 @@ class encodeExperiment:
         
         return files_by_type
     
-    def get_file_accessions_by_type(self, after_date=None, file_types=None):
+    def get_file_accessions_by_type(self, after_date: Optional[str] = None, file_types: Optional[list[str]] = None) -> dict[str, list[str]]:
         """
         Get a simplified dictionary of file accessions organized by file type.
         
@@ -422,7 +486,7 @@ class encodeExperiment:
         
         return accessions_dict
     
-    def get_file_types(self):
+    def get_file_types(self) -> list[str]:
         """
         Get the list of available file types in this experiment.
         
@@ -433,7 +497,7 @@ class encodeExperiment:
         files_by_type = self.get_files_by_type()
         return sorted(files_by_type.keys())
     
-    def get_available_output_categories(self):
+    def get_available_output_categories(self) -> list[str]:
         """
         Get the list of available output categories in this experiment.
         
@@ -450,7 +514,7 @@ class encodeExperiment:
                     categories.add(category)
         return sorted(categories)
     
-    def get_available_output_types(self):
+    def get_available_output_types(self) -> list[str]:
         """
         Get the list of available output types in this experiment.
         
@@ -467,7 +531,7 @@ class encodeExperiment:
                     types.add(output_type)
         return sorted(types)
     
-    def get_file_accessions_by_output_category(self, output_categories=None):
+    def get_file_accessions_by_output_category(self, output_categories: Optional[list[str]] = None) -> dict[str, list[str]]:
         """
         Get file accessions organized by output category (e.g., 'raw data', 'processed data').
         
@@ -504,7 +568,7 @@ class encodeExperiment:
         
         return accessions_by_category
     
-    def get_file_accessions_by_output_type(self, output_types=None):
+    def get_file_accessions_by_output_type(self, output_types: Optional[list[str]] = None) -> dict[str, list[str]]:
         """
         Get file accessions organized by output type (e.g., 'reads', 'alignments', 'peaks').
         
@@ -541,7 +605,7 @@ class encodeExperiment:
         
         return accessions_by_type
     
-    def get_file_metadata(self, accession):
+    def get_file_metadata(self, accession: str) -> Optional[dict[str, Any]]:
         """
         Get comprehensive metadata for a specific file accession.
         
@@ -560,7 +624,7 @@ class encodeExperiment:
         
         return None
     
-    def get_file_url(self, accession):
+    def get_file_url(self, accession: str) -> Optional[str]:
         """
         Get the download URL for a file accession.
         
@@ -582,7 +646,7 @@ class encodeExperiment:
         
         return None
     
-    def get_files_summary(self, max_files_per_type=None):
+    def get_files_summary(self, max_files_per_type: Optional[int] = None) -> dict[str, dict[str, Any]]:
         """
         Get a summary of files organized by type with optional detail limiting.
         
@@ -610,7 +674,7 @@ class encodeExperiment:
         
         return summary
     
-    def clear_cache(self, refresh=False):
+    def clear_cache(self, refresh: bool = False) -> bool:
         """
         Clear or refresh the cached metadata for this experiment.
         
@@ -631,11 +695,73 @@ class encodeExperiment:
         
         return True
     
-    def download_files(self, output_dir, file_types=None, accessions=None):
+    def _download_single_file(
+        self,
+        file_obj: dict[str, Any],
+        output_path: Path,
+    ) -> tuple[str, str, Optional[str]]:
+        """Download a single file. Returns (accession, status, error_or_None).
+
+        status is one of: 'downloaded', 'skipped', 'failed'.
+        """
+        accession = file_obj.get('accession', 'unknown')
+
+        # Resolve filename
+        filename = file_obj.get('filename')
+        if not filename:
+            href = file_obj.get('href', '')
+            if href and '@@download/' in href:
+                filename = href.split('@@download/')[-1]
+
+        if not accession or not filename:
+            return (accession, 'skipped', None)
+
+        # Sanitize filename to prevent path traversal
+        filename = os.path.basename(filename)
+        if not filename or filename.startswith('.') or '/' in filename or '\\' in filename:
+            return (accession, 'failed', "Invalid or unsafe filename")
+
+        file_path = output_path / filename
+
+        # Skip existing files
+        if file_path.exists():
+            return (accession, 'skipped', None)
+
+        url = file_obj.get('href')
+        if not url:
+            return (accession, 'failed', "No download URL (href) found")
+        if not url.startswith('http'):
+            url = f"https://www.encodeproject.org{url}"
+
+        temp_path = output_path / f"{filename}.tmp"
+        try:
+            response = _request_with_retry(url, timeout=300, stream=True)
+            file_size = 0
+            with open(temp_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        file_size += len(chunk)
+            temp_path.rename(file_path)
+            logger.info("Downloaded %s (%s, %s bytes)", accession, filename, f"{file_size:,}")
+            return (accession, 'downloaded', None)
+        except Exception as exc:
+            if temp_path.exists():
+                temp_path.unlink()
+            return (accession, 'failed', str(exc))
+
+    def download_files(
+        self,
+        output_dir: str,
+        file_types: Optional[str | list[str]] = None,
+        accessions: Optional[str | list[str]] = None,
+        max_workers: int = 4,
+    ) -> dict[str, Any]:
         """
         Download files from this experiment to a local directory.
         
         Automatically ensures experiment metadata is loaded before attempting downloads.
+        Uses parallel downloads for speed (configurable via *max_workers*).
         
         Parameters:
         - output_dir: Path to directory where files will be saved (will be created if doesn't exist)
@@ -643,6 +769,7 @@ class encodeExperiment:
                       If None and accessions is None, all files are downloaded
         - accessions: str or list of str specifying specific file accessions to download (e.g., 'ENCFF001JZK')
                       Takes precedence over file_types if both specified
+        - max_workers: Maximum number of parallel downloads (default: 4)
         
         Returns:
         - Dictionary with download results:
@@ -685,7 +812,7 @@ class encodeExperiment:
             accessions = [accessions]
         
         # Collect files to download
-        files_to_download = []
+        files_to_download: list[dict[str, Any]] = []
         
         if accessions:
             # Download specific accessions
@@ -703,80 +830,25 @@ class encodeExperiment:
             for file_type, files in files_by_type.items():
                 files_to_download.extend(files)
         
-        # Download files
-        downloaded = []
-        failed = []
-        skipped = []
+        downloaded: list[str] = []
+        failed: list[tuple[str, str]] = []
+        skipped: list[str] = []
         
         print(f"Downloading {len(files_to_download)} file(s) to {output_path}")
         
-        for i, file_obj in enumerate(files_to_download, 1):
-            accession = file_obj.get('accession')
-            
-            # Try to get filename from 'filename' field, or extract from 'href'
-            filename = file_obj.get('filename')
-            if not filename:
-                # Extract filename from href (e.g., /files/ENCFF001JZK/@@download/ENCFF001JZK.fastq.gz -> ENCFF001JZK.fastq.gz)
-                href = file_obj.get('href', '')
-                if href and '@@download/' in href:
-                    filename = href.split('@@download/')[-1]
-            
-            if not accession or not filename:
-                skipped.append(accession or 'unknown')
-                continue
-            
-            # Sanitize filename to prevent path traversal
-            # Remove any directory components and only keep the base filename
-            filename = os.path.basename(filename)
-            if not filename or filename.startswith('.') or '/' in filename or '\\' in filename:
-                failed.append((accession, "Invalid or unsafe filename"))
-                continue
-            
-            file_path = output_path / filename
-            
-            # Check if file already exists
-            if file_path.exists():
-                print(f"  [{i}/{len(files_to_download)}] {accession} ({filename}) - SKIPPED (exists)")
-                skipped.append(accession)
-                continue
-            
-            try:
-                # Get download URL
-                url = file_obj.get('href')
-                if not url:
-                    failed.append((accession, "No download URL (href) found"))
-                    continue
-                
-                if not url.startswith('http'):
-                    url = f"https://www.encodeproject.org{url}"
-                
-                # Download file
-                print(f"  [{i}/{len(files_to_download)}] Downloading {accession} ({filename})...", end='')
-                
-                response = requests.get(url, timeout=300, stream=True)
-                response.raise_for_status()
-                
-                file_size = 0
-                temp_path = output_path / f"{filename}.tmp"
-                with open(temp_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            file_size += len(chunk)
-                
-                # Rename temp file to final name only after successful download
-                temp_path.rename(file_path)
-                downloaded.append(accession)
-                print(f" DONE ({file_size:,} bytes)")
-                
-            except Exception as e:
-                failed.append((accession, str(e)))
-                print(f" FAILED ({e})")
-                # Remove partially downloaded file
-                if 'temp_path' in locals() and temp_path.exists():
-                    temp_path.unlink()
-                elif file_path.exists():
-                    file_path.unlink()
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(self._download_single_file, fobj, output_path): fobj
+                for fobj in files_to_download
+            }
+            for future in as_completed(futures):
+                acc, status, error = future.result()
+                if status == 'downloaded':
+                    downloaded.append(acc)
+                elif status == 'failed':
+                    failed.append((acc, error or 'unknown error'))
+                else:
+                    skipped.append(acc)
         
         # Print summary
         print(f"\nDownload Summary:")
@@ -786,8 +858,8 @@ class encodeExperiment:
         
         if failed:
             print(f"\nFailed downloads:")
-            for accession, error in failed:
-                print(f"  {accession}: {error}")
+            for acc, error in failed:
+                print(f"  {acc}: {error}")
         
         return {
             'downloaded': downloaded,
@@ -805,7 +877,7 @@ class ENCODE:
     CACHE_FILE = CACHE_DIR / "experiments.json"
     METADATA_CACHE_DIR = CACHE_DIR / "metadata"  # Hierarchical cache for individual experiment metadata
     
-    def __init__(self, use_cache=True, force_refresh=False, cache_dir=None):
+    def __init__(self, use_cache: bool = True, force_refresh: bool = False, cache_dir: Optional[str] = None) -> None:
         """
         Initialize ENCODE object by loading all experiments from the ENCODE database.
         
@@ -816,7 +888,7 @@ class ENCODE:
         """
         self.base_url = self.BASE_URL
         self.url = f"{self.base_url}/experiments/"
-        self.query_params = {
+        self.query_params: dict[str, str] = {
             "format": "json",
             "limit": "all"  # Get all results
         }
@@ -833,9 +905,12 @@ class ENCODE:
             self.cache_file = self.CACHE_FILE
             self.metadata_cache_dir = self.METADATA_CACHE_DIR
         
-        self.experiments = self._load_experiments()
+        # In-memory cache for file-accession lookups (file_accession -> API response)
+        self._file_info_cache: dict[str, dict[str, Any]] = {}
+        
+        self.experiments: list[dict[str, Any]] = self._load_experiments()
     
-    def _load_experiments(self):
+    def _load_experiments(self) -> list[dict[str, Any]]:
         """Load experiments from cache or ENCODE API"""
         # Try to load from cache if enabled and not forcing refresh
         if self.use_cache and not self.force_refresh and self.cache_file.exists():
@@ -853,8 +928,7 @@ class ENCODE:
         print("Loading all experiments from ENCODE database...")
         print("(This may take a minute...)\n")
         
-        response = requests.get(self.url, params=self.query_params, timeout=120)
-        response.raise_for_status()
+        response = _request_with_retry(self.url, params=self.query_params, timeout=120)
         data = response.json()
         
         experiments = data.get('@graph', [])
@@ -866,7 +940,7 @@ class ENCODE:
         
         return experiments
     
-    def _save_cache(self, experiments):
+    def _save_cache(self, experiments: list[dict[str, Any]]) -> None:
         """Save experiments to cache file"""
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -877,7 +951,7 @@ class ENCODE:
         except Exception as e:
             print(f"Warning: Could not save cache ({e})\n")
     
-    def save(self, filepath=None):
+    def save(self, filepath: Optional[str] = None) -> Path:
         """
         Save the current experiments list to a file.
         
@@ -902,7 +976,7 @@ class ENCODE:
         except Exception as e:
             raise IOError(f"Could not save experiments to {filepath}: {e}")
     
-    def clear_cache(self, cache_dir=None):
+    def clear_cache(self, cache_dir: Optional[str] = None) -> None:
         """
         Clear the cache file.
         
@@ -921,7 +995,7 @@ class ENCODE:
         except Exception as e:
             raise IOError(f"Could not clear cache: {e}")
     
-    def _get_metadata_cache_path(self, accession):
+    def _get_metadata_cache_path(self, accession: str) -> Path:
         """
         Get the cache file path for an experiment's metadata.
         
@@ -934,7 +1008,7 @@ class ENCODE:
         Returns:
         - Path object for the cache file
         """
-        if not accession or len(accession) < 5:
+        if not accession or len(accession) < 5 or not accession.startswith('ENC'):
             raise ValueError(f"Invalid accession format: {accession}")
         
         # Extract type prefix (e.g., 'SR' from 'ENCSR000CDC')
@@ -942,7 +1016,7 @@ class ENCODE:
         cache_path = self.metadata_cache_dir / type_prefix / f"{accession}.json"
         return cache_path
     
-    def _save_experiment_metadata(self, accession, data):
+    def _save_experiment_metadata(self, accession: str, data: dict[str, Any]) -> None:
         """
         Save experiment metadata to cache.
         
@@ -959,7 +1033,7 @@ class ENCODE:
             # Silently fail on cache write - it's not critical
             pass
     
-    def _load_experiment_metadata(self, accession):
+    def _load_experiment_metadata(self, accession: str) -> Optional[dict[str, Any]]:
         """
         Load experiment metadata from cache.
         
@@ -983,7 +1057,7 @@ class ENCODE:
         
         return None
     
-    def clear_metadata_cache(self, accession=None):
+    def clear_metadata_cache(self, accession: Optional[str] = None) -> None:
         """
         Clear metadata cache for specific experiment or all experiments.
         
@@ -1005,7 +1079,7 @@ class ENCODE:
         except Exception as e:
             raise IOError(f"Could not clear metadata cache: {e}")
     
-    def get_metadata_cache_stats(self):
+    def get_metadata_cache_stats(self) -> dict[str, Any]:
         """
         Get statistics about the metadata cache.
         
@@ -1043,7 +1117,7 @@ class ENCODE:
         stats['cache_size_mb'] = round(stats['cache_size_bytes'] / (1024 * 1024), 2)
         return stats
     
-    def create_experiment_object(self, experiment_data):
+    def create_experiment_object(self, experiment_data: dict[str, Any]) -> encodeExperiment:
         """
         Create an encodeExperiment object directly from experiment data.
         
@@ -1058,7 +1132,7 @@ class ENCODE:
         """
         return encodeExperiment(experiment_data=experiment_data, encode_obj=self)
     
-    def getExperiment(self, accession):
+    def getExperiment(self, accession: str) -> encodeExperiment:
         """
         Create an encodeExperiment object from an experiment accession.
         
@@ -1076,7 +1150,7 @@ class ENCODE:
         """
         return encodeExperiment(accession=accession, encode_obj=self)
     
-    def get_organism_from_experiment(self, exp):
+    def get_organism_from_experiment(self, exp: dict[str, Any]) -> Optional[str]:
         """Extract organism scientific name from experiment replicates"""
         if 'replicates' not in exp or not exp['replicates']:
             return None
@@ -1090,17 +1164,17 @@ class ENCODE:
                         return biosample['organism'].get('scientific_name')
         return None
     
-    def count_replicates(self, experiment):
+    def count_replicates(self, experiment: dict[str, Any]) -> int:
         """Count the number of replicates in an experiment"""
         replicates = experiment.get('replicates', [])
         return len(replicates) if replicates else 0
     
-    def is_revoked(self, experiment):
+    def is_revoked(self, experiment: dict[str, Any]) -> bool:
         """Check if an experiment is revoked"""
         status = experiment.get('status', '')
         return status == 'revoked'
     
-    def get_targets(self, experiment):
+    def get_targets(self, experiment: dict[str, Any]) -> list[str]:
         """Extract target(s) from an experiment
         
         Returns a list of target labels. For most experiments, there's one target.
@@ -1134,11 +1208,20 @@ class ENCODE:
         
         return []
     
-    def has_target(self, experiment):
+    def has_target(self, experiment: dict[str, Any]) -> bool:
         """Check if an experiment has a target"""
         return len(self.get_targets(experiment)) > 0
     
-    def search_experiments_by_organism(self, organism, search_term=None, experiments_list=None, assay_title=None, target=None, exclude_revoked=True, return_objects=True):
+    def search_experiments_by_organism(
+        self,
+        organism: str,
+        search_term: Optional[str] = None,
+        experiments_list: Optional[list[dict[str, Any]]] = None,
+        assay_title: Optional[str] = None,
+        target: Optional[str] = None,
+        exclude_revoked: bool = True,
+        return_objects: bool = True,
+    ) -> list[encodeExperiment] | list[dict[str, Any]]:
         """
         Search for experiments by organism.
         
@@ -1201,7 +1284,16 @@ class ENCODE:
             return [encodeExperiment(exp.get('accession'), self) for exp in matching]
         return matching
     
-    def search_experiments_by_biosample(self, search_term, experiments_list=None, organism=None, assay_title=None, target=None, exclude_revoked=True, return_objects=True):
+    def search_experiments_by_biosample(
+        self,
+        search_term: str,
+        experiments_list: Optional[list[dict[str, Any]]] = None,
+        organism: Optional[str] = None,
+        assay_title: Optional[str] = None,
+        target: Optional[str] = None,
+        exclude_revoked: bool = True,
+        return_objects: bool = True,
+    ) -> list[encodeExperiment] | list[dict[str, Any]]:
         """
         Search for experiments by cell type, tissue name, or target.
         
@@ -1266,7 +1358,15 @@ class ENCODE:
             return [encodeExperiment(exp.get('accession'), self) for exp in matching]
         return matching
      
-    def search_experiments_by_target(self, target, experiments_list=None, organism=None, assay_title=None, exclude_revoked=True, return_objects=True):
+    def search_experiments_by_target(
+        self,
+        target: str,
+        experiments_list: Optional[list[dict[str, Any]]] = None,
+        organism: Optional[str] = None,
+        assay_title: Optional[str] = None,
+        exclude_revoked: bool = True,
+        return_objects: bool = True,
+    ) -> list[encodeExperiment] | list[dict[str, Any]]:
         """
         Search for all experiments with a specific target (supports partial matching).
         
@@ -1317,7 +1417,7 @@ class ENCODE:
             return [encodeExperiment(exp.get('accession'), self) for exp in matching]
         return matching
     
-    def get_samples_dataframe(self, organism=None, assay_type=None):
+    def get_samples_dataframe(self, organism: Optional[str] = None, assay_type: Optional[list[str]] = None) -> pd.DataFrame:
         """
         Create and return a DataFrame of samples with optional filtering.
         
@@ -1356,3 +1456,112 @@ class ENCODE:
         
         return pd.DataFrame(samples_data)
 
+    # ------------------------------------------------------------------
+    # File-accession-level lookup (no experiment accession required)
+    # ------------------------------------------------------------------
+
+    def _fetch_file_info(self, file_accession: str) -> dict[str, Any]:
+        """Fetch full metadata for a single file from the ENCODE API.
+
+        Results are cached in ``_file_info_cache`` for the lifetime of this
+        ``ENCODE`` instance.
+
+        Parameters:
+        - file_accession: ENCODE file accession (e.g., 'ENCFF001RJK')
+
+        Returns:
+        - Dictionary with all file metadata from the ENCODE API.
+
+        Raises:
+        - ValueError: If the accession format is invalid or the file is not found.
+        """
+        if not file_accession or not file_accession.startswith("ENCFF") or len(file_accession) < 6:
+            raise ValueError(f"Invalid file accession format: {file_accession}")
+
+        if file_accession in self._file_info_cache:
+            return self._file_info_cache[file_accession]
+
+        url = f"{self.base_url}/files/{file_accession}/"
+        response = _request_with_retry(url, params={"format": "json"}, timeout=30)
+        data: dict[str, Any] = response.json()
+
+        self._file_info_cache[file_accession] = data
+        return data
+
+    def search_experiments_by_file_accession(
+        self,
+        file_accession: str,
+    ) -> Optional[encodeExperiment]:
+        """Look up the experiment that contains a given file accession.
+
+        Not all ENCODE files belong to experiments — genome references,
+        annotations, and other datasets will have a ``dataset`` field that
+        points to a non-experiment path (e.g., ``/annotations/...``).  In
+        that case this method returns ``None``.
+
+        Parameters:
+        - file_accession: ENCODE file accession (e.g., 'ENCFF001RJK')
+
+        Returns:
+        - An ``encodeExperiment`` object if the file belongs to an experiment,
+          or ``None`` if the file exists but is not part of an experiment.
+
+        Raises:
+        - ValueError: If the file accession is invalid or not found on ENCODE.
+        """
+        file_info = self._fetch_file_info(file_accession)
+
+        dataset = file_info.get("dataset", "")
+        if isinstance(dataset, dict):
+            dataset = dataset.get("@id", "")
+
+        # dataset looks like "/experiments/ENCSR000CDC/" for experiment files
+        if "/experiments/" in dataset:
+            parts = dataset.strip("/").split("/")
+            try:
+                exp_accession = parts[parts.index("experiments") + 1]
+            except (ValueError, IndexError):
+                return None
+            return self.getExperiment(exp_accession)
+
+        # File exists but doesn't belong to an experiment
+        return None
+
+    def get_file_metadata(self, file_accession: str) -> Optional[dict[str, Any]]:
+        """Get metadata for any ENCODE file by its accession.
+
+        Works for **all** ENCODE files — experiment files, genome references,
+        annotations, etc.  Does not require knowing the parent experiment.
+
+        Parameters:
+        - file_accession: ENCODE file accession (e.g., 'ENCFF001RJK')
+
+        Returns:
+        - Dictionary with full file metadata, or ``None`` if not found.
+        """
+        try:
+            return self._fetch_file_info(file_accession)
+        except (ValueError, requests.exceptions.HTTPError):
+            return None
+
+    def get_file_url(self, file_accession: str) -> Optional[str]:
+        """Get the download URL for any ENCODE file by its accession.
+
+        Works for **all** ENCODE files — experiment files, genome references,
+        annotations, etc.  Does not require knowing the parent experiment.
+
+        Parameters:
+        - file_accession: ENCODE file accession (e.g., 'ENCFF001RJK')
+
+        Returns:
+        - Full download URL string, or ``None`` if not found.
+        """
+        try:
+            info = self._fetch_file_info(file_accession)
+        except (ValueError, requests.exceptions.HTTPError):
+            return None
+
+        href = info.get("href")
+        if href:
+            return f"{self.base_url}{href}"
+        return None

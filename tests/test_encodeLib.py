@@ -14,6 +14,7 @@ import unittest
 import tempfile
 import shutil
 import json
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch, MagicMock
 import sys
@@ -22,7 +23,7 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from encodeLib import ENCODE, encodeExperiment
+from encodeLib import ENCODE, encodeExperiment, _request_with_retry
 
 
 class TestENCODEInitialization(unittest.TestCase):
@@ -642,19 +643,298 @@ class TestFileDownloadSecurity(unittest.TestCase):
         exp = encodeExperiment(experiment_data=test_exp_data)
         
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch('encodeLib.requests.get') as mock_get:
+            with patch('encodeLib._request_with_retry') as mock_req:
                 # Mock successful download response
                 mock_response = Mock()
                 mock_response.raise_for_status.return_value = None
                 mock_response.iter_content.return_value = [b'test']
-                mock_get.return_value = mock_response
+                mock_req.return_value = mock_response
                 
                 result = exp.download_files(tmpdir)
                 
-                # Path traversal file should fail
-                self.assertIn('ENCFF001', [acc for acc, _ in result['failed']])
-                # Hidden file should fail
+                # Path traversal is neutralized by os.path.basename:
+                # '../../../etc/passwd' -> 'passwd' (safe)
+                self.assertIn('ENCFF001', result['downloaded'])
+                # Verify file was saved with sanitized name, not the traversal path
+                self.assertTrue((Path(tmpdir) / 'passwd').exists())
+                self.assertFalse((Path(tmpdir) / '..' / '..' / '..' / 'etc' / 'passwd').exists())
+                # Hidden file should still fail
                 self.assertIn('ENCFF002', [acc for acc, _ in result['failed']])
+
+
+class TestRetryLogic(unittest.TestCase):
+    """Test HTTP retry with exponential backoff."""
+
+    @patch('encodeLib.time.sleep')
+    @patch('encodeLib.requests.get')
+    def test_retry_on_connection_error(self, mock_get, mock_sleep):
+        """Retry twice on ConnectionError then succeed."""
+        good_resp = Mock()
+        good_resp.status_code = 200
+        good_resp.raise_for_status.return_value = None
+
+        import requests as _req
+        mock_get.side_effect = [
+            _req.exceptions.ConnectionError("refused"),
+            _req.exceptions.ConnectionError("refused"),
+            good_resp,
+        ]
+        result = _request_with_retry("http://example.com", max_retries=3)
+        self.assertIs(result, good_resp)
+        self.assertEqual(mock_get.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+
+    @patch('encodeLib.time.sleep')
+    @patch('encodeLib.requests.get')
+    def test_retry_on_timeout(self, mock_get, mock_sleep):
+        """Retry on Timeout exception."""
+        good_resp = Mock()
+        good_resp.status_code = 200
+        good_resp.raise_for_status.return_value = None
+
+        import requests as _req
+        mock_get.side_effect = [
+            _req.exceptions.Timeout("timed out"),
+            good_resp,
+        ]
+        result = _request_with_retry("http://example.com", max_retries=2)
+        self.assertIs(result, good_resp)
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch('encodeLib.time.sleep')
+    @patch('encodeLib.requests.get')
+    def test_retry_max_exceeded(self, mock_get, mock_sleep):
+        """Raise after max retries exhausted."""
+        import requests as _req
+        mock_get.side_effect = _req.exceptions.ConnectionError("refused")
+
+        with self.assertRaises(_req.exceptions.ConnectionError):
+            _request_with_retry("http://example.com", max_retries=3)
+        self.assertEqual(mock_get.call_count, 3)
+
+    @patch('encodeLib.time.sleep')
+    @patch('encodeLib.requests.get')
+    def test_no_retry_on_client_error(self, mock_get, mock_sleep):
+        """Do NOT retry on 404 (client error)."""
+        import requests as _req
+        bad_resp = Mock()
+        bad_resp.status_code = 404
+        bad_resp.raise_for_status.side_effect = _req.exceptions.HTTPError("404")
+        mock_get.return_value = bad_resp
+
+        with self.assertRaises(_req.exceptions.HTTPError):
+            _request_with_retry("http://example.com", max_retries=3)
+        # Should only be called once — no retry on 4xx
+        self.assertEqual(mock_get.call_count, 1)
+        mock_sleep.assert_not_called()
+
+
+class TestParallelDownloads(unittest.TestCase):
+    """Test parallel file download functionality."""
+
+    def setUp(self):
+        self.test_exp_data = {
+            'accession': 'ENCSR000PAR',
+            'files': [
+                {
+                    'accession': f'ENCFF00{i}',
+                    'file_type': 'fastq',
+                    'status': 'released',
+                    'filename': f'file{i}.fastq.gz',
+                    'href': f'/files/ENCFF00{i}/@@download/file{i}.fastq.gz',
+                }
+                for i in range(1, 4)
+            ],
+        }
+
+    @patch('encodeLib._request_with_retry')
+    def test_parallel_download_basic(self, mock_req):
+        """Download multiple files in parallel successfully."""
+        mock_resp = Mock()
+        mock_resp.iter_content.return_value = [b'data']
+        mock_req.return_value = mock_resp
+
+        exp = encodeExperiment(experiment_data=self.test_exp_data)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = exp.download_files(tmpdir)
+            self.assertEqual(len(result['downloaded']), 3)
+            self.assertEqual(len(result['failed']), 0)
+
+    @patch('encodeLib._request_with_retry')
+    def test_parallel_download_skip_existing(self, mock_req):
+        """Existing files are skipped."""
+        mock_resp = Mock()
+        mock_resp.iter_content.return_value = [b'data']
+        mock_req.return_value = mock_resp
+
+        exp = encodeExperiment(experiment_data=self.test_exp_data)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Pre-create one file
+            (Path(tmpdir) / 'file1.fastq.gz').write_bytes(b'existing')
+            result = exp.download_files(tmpdir)
+            self.assertIn('ENCFF001', result['skipped'])
+            self.assertEqual(len(result['downloaded']), 2)
+
+    @patch('encodeLib._request_with_retry')
+    def test_parallel_download_failure_handling(self, mock_req):
+        """One failed download doesn't prevent others from succeeding."""
+        call_count = 0
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ConnectionError("network error")
+            resp = Mock()
+            resp.iter_content.return_value = [b'data']
+            return resp
+
+        mock_req.side_effect = side_effect
+
+        exp = encodeExperiment(experiment_data=self.test_exp_data)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = exp.download_files(tmpdir)
+            self.assertEqual(len(result['failed']), 1)
+            self.assertEqual(len(result['downloaded']), 2)
+
+
+class TestSearchByFileAccession(unittest.TestCase):
+    """Test ENCODE-class file-accession-level methods."""
+
+    def _create_mock_encode(self):
+        """Create a mock ENCODE instance without API calls."""
+        encode = ENCODE.__new__(ENCODE)
+        encode.base_url = "https://www.encodeproject.org"
+        encode.experiments = []
+        encode.use_cache = False
+        encode.metadata_cache_dir = Path("/tmp/test_cache_fa/metadata")
+        encode._file_info_cache = {}
+        return encode
+
+    @patch('encodeLib._request_with_retry')
+    def test_search_by_file_accession_success(self, mock_req):
+        """File in an experiment returns the experiment object."""
+        # Mock the file API response
+        file_resp = Mock()
+        file_resp.json.return_value = {
+            'accession': 'ENCFF001RJK',
+            'dataset': '/experiments/ENCSR000CDC/',
+            'href': '/files/ENCFF001RJK/@@download/ENCFF001RJK.fastq.gz',
+        }
+        # Mock the experiment API response
+        exp_resp = Mock()
+        exp_resp.json.return_value = {
+            'accession': 'ENCSR000CDC',
+            'status': 'released',
+            'biosample_summary': 'K562',
+            'assay_title': 'TF ChIP-seq',
+            'lab': {'title': 'Test Lab'},
+            'files': [],
+        }
+        mock_req.side_effect = [file_resp, exp_resp]
+
+        encode = self._create_mock_encode()
+        result = encode.search_experiments_by_file_accession('ENCFF001RJK')
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.accession, 'ENCSR000CDC')
+
+    @patch('encodeLib._request_with_retry')
+    def test_search_by_file_accession_non_experiment(self, mock_req):
+        """File not in an experiment (e.g., genome reference) returns None."""
+        file_resp = Mock()
+        file_resp.json.return_value = {
+            'accession': 'ENCFF999ZZZ',
+            'dataset': '/annotations/ENCSR999ANN/',
+            'href': '/files/ENCFF999ZZZ/@@download/ref.fasta.gz',
+        }
+        mock_req.return_value = file_resp
+
+        encode = self._create_mock_encode()
+        result = encode.search_experiments_by_file_accession('ENCFF999ZZZ')
+
+        self.assertIsNone(result)
+
+    @patch('encodeLib._request_with_retry')
+    def test_search_by_file_accession_caching(self, mock_req):
+        """Second call uses cache, doesn't hit API again."""
+        file_resp = Mock()
+        file_resp.json.return_value = {
+            'accession': 'ENCFF001RJK',
+            'dataset': '/annotations/ENCSR000ANN/',
+            'href': '/files/ENCFF001RJK/@@download/file.gz',
+        }
+        mock_req.return_value = file_resp
+
+        encode = self._create_mock_encode()
+        encode.search_experiments_by_file_accession('ENCFF001RJK')
+        encode.search_experiments_by_file_accession('ENCFF001RJK')
+
+        # _request_with_retry should only be called once (cached after first)
+        self.assertEqual(mock_req.call_count, 1)
+
+    def test_search_by_file_accession_invalid(self):
+        """Invalid accession raises ValueError."""
+        encode = self._create_mock_encode()
+
+        with self.assertRaises(ValueError):
+            encode.search_experiments_by_file_accession('BADID')
+
+        with self.assertRaises(ValueError):
+            encode.search_experiments_by_file_accession('ENCSR000CDC')  # Not ENCFF
+
+    @patch('encodeLib._request_with_retry')
+    def test_get_file_metadata_experiment_file(self, mock_req):
+        """ENCODE.get_file_metadata works for an experiment file."""
+        file_resp = Mock()
+        file_resp.json.return_value = {
+            'accession': 'ENCFF001RJK',
+            'file_type': 'fastq',
+            'dataset': '/experiments/ENCSR000CDC/',
+            'href': '/files/ENCFF001RJK/@@download/ENCFF001RJK.fastq.gz',
+        }
+        mock_req.return_value = file_resp
+
+        encode = self._create_mock_encode()
+        metadata = encode.get_file_metadata('ENCFF001RJK')
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata['accession'], 'ENCFF001RJK')
+        self.assertEqual(metadata['file_type'], 'fastq')
+
+    @patch('encodeLib._request_with_retry')
+    def test_get_file_metadata_non_experiment_file(self, mock_req):
+        """ENCODE.get_file_metadata works for a non-experiment file (genome ref)."""
+        file_resp = Mock()
+        file_resp.json.return_value = {
+            'accession': 'ENCFF999REF',
+            'file_type': 'fasta',
+            'dataset': '/references/ENCSR000REF/',
+            'href': '/files/ENCFF999REF/@@download/genome.fasta.gz',
+        }
+        mock_req.return_value = file_resp
+
+        encode = self._create_mock_encode()
+        metadata = encode.get_file_metadata('ENCFF999REF')
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata['file_type'], 'fasta')
+
+    @patch('encodeLib._request_with_retry')
+    def test_get_file_url_from_encode(self, mock_req):
+        """ENCODE.get_file_url returns full URL for any file."""
+        file_resp = Mock()
+        file_resp.json.return_value = {
+            'accession': 'ENCFF001RJK',
+            'href': '/files/ENCFF001RJK/@@download/ENCFF001RJK.fastq.gz',
+        }
+        mock_req.return_value = file_resp
+
+        encode = self._create_mock_encode()
+        url = encode.get_file_url('ENCFF001RJK')
+
+        self.assertIsNotNone(url)
+        self.assertIn('encodeproject.org', url)
+        self.assertIn('ENCFF001RJK', url)
 
 
 if __name__ == '__main__':

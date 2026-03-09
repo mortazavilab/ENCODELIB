@@ -23,7 +23,7 @@ import pytest
 import requests
 from typing import Any
 
-BASE_URL = os.environ.get("MCP_SERVER_URL", "http://128.200.7.223:8080/mcp")
+BASE_URL = os.environ.get("MCP_SERVER_URL", "http://127.0.0.1:8080/mcp")
 DEFAULT_TIMEOUT = 10.0
 
 

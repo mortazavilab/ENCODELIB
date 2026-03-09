@@ -3,14 +3,18 @@
 ENCODE fastmcp Server
 
 A fastmcp server exposing ENCODE library functionality.
-Runs on http://0.0.0.0:8080
+Default: http://127.0.0.1:8080
 
 Usage:
-    fastmcp run encode_server.py
+    python3 encode_server.py
+    python3 encode_server.py --host 0.0.0.0 --port 9090
+    ENCODE_SERVER_API_KEY=mysecret python3 encode_server.py --require-api-key
 """
 
+import argparse
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 from fastmcp import FastMCP
@@ -18,7 +22,7 @@ from fastmcp import FastMCP
 from encodeLib import ENCODE, encodeExperiment
 
 
-__version__ = "0.2"
+__version__ = "0.3"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +42,25 @@ server = FastMCP("encode-server")
 
 # Global ENCODE instance (lazily initialized)
 _encode_instance = None
+
+# Optional API-key authentication
+_REQUIRE_API_KEY = os.environ.get("ENCODE_REQUIRE_API_KEY", "").lower() in ("1", "true", "yes")
+_API_KEY = os.environ.get("ENCODE_SERVER_API_KEY", "")
+
+
+def _check_api_key(api_key: Optional[str] = None) -> None:
+    """Raise ValueError when auth is required and the key doesn't match."""
+    if not _REQUIRE_API_KEY:
+        return
+    if not _API_KEY:
+        # Server operator has not configured a key — skip check
+        return
+    if not api_key or not isinstance(api_key, str):
+        raise ValueError("API key required. Pass api_key parameter.")
+    # Constant-time comparison to avoid timing attacks
+    import hmac
+    if not hmac.compare_digest(api_key, _API_KEY):
+        raise ValueError("Invalid API key.")
 
 
 def get_encode_instance() -> ENCODE:
@@ -451,6 +474,100 @@ def get_file_url(accession: str, file_accession: str) -> dict:
 
 
 # ============================================================================
+# File Accession Tools (no experiment accession required)
+# ============================================================================
+
+
+@server.tool()
+def search_by_file_accession(file_accession: str) -> dict:
+    """
+    Find the experiment that contains a given file accession.
+
+    Works for any ENCODE file. If the file belongs to an experiment the full
+    experiment metadata is returned. If the file exists but is NOT part of an
+    experiment (e.g., a genome reference or annotation), the response says so.
+
+    Args:
+        file_accession: ENCODE file accession (e.g., 'ENCFF001RJK')
+
+    Returns:
+        Dictionary with experiment metadata, or a message when the file is
+        not associated with an experiment.
+    """
+    encode = get_encode_instance()
+    exp = encode.search_experiments_by_file_accession(file_accession)
+
+    if exp is None:
+        return {
+            "experiment": None,
+            "file_accession": file_accession,
+            "message": (
+                "File exists but is not part of an experiment "
+                "(e.g., genome reference or annotation)."
+            ),
+        }
+
+    return {
+        "accession": exp.accession,
+        "organism": exp.organism,
+        "assay": exp.assay,
+        "biosample": exp.biosample,
+        "lab": exp.lab,
+        "status": exp.status,
+        "targets": exp.targets,
+        "replicate_count": exp.replicate_count,
+        "description": exp.description,
+        "link": exp.link,
+    }
+
+
+@server.tool()
+def get_file_metadata_by_accession(file_accession: str) -> dict:
+    """
+    Get comprehensive metadata for any ENCODE file by its accession alone.
+
+    Works for ALL files — experiment files, genome references, annotations,
+    etc. No experiment accession is required.
+
+    Args:
+        file_accession: ENCODE file accession (e.g., 'ENCFF001RJK')
+
+    Returns:
+        Complete file metadata dictionary, or error message.
+    """
+    encode = get_encode_instance()
+    metadata = encode.get_file_metadata(file_accession)
+
+    if metadata is None:
+        return {"error": f"File accession {file_accession} not found"}
+
+    return metadata
+
+
+@server.tool()
+def get_file_url_by_accession(file_accession: str) -> dict:
+    """
+    Get the download URL for any ENCODE file by its accession alone.
+
+    Works for ALL files — experiment files, genome references, annotations,
+    etc. No experiment accession is required.
+
+    Args:
+        file_accession: ENCODE file accession (e.g., 'ENCFF001RJK')
+
+    Returns:
+        Dictionary with download URL, or error message.
+    """
+    encode = get_encode_instance()
+    url = encode.get_file_url(file_accession)
+
+    if url is None:
+        return {"error": f"File accession {file_accession} not found"}
+
+    return {"url": url}
+
+
+# ============================================================================
 # Download Tools
 # ============================================================================
 
@@ -586,20 +703,37 @@ def get_server_info() -> dict:
     return {
         "server_name": "ENCODE fastmcp Server",
         "version": __version__,
-        "port": 8080,
-        "host": "0.0.0.0",
         "work_dir": str(WORK_DIR),
         "cache_dir": str(CACHE_DIR),
         "files_dir": str(FILES_DIR),
+        "auth_required": _REQUIRE_API_KEY,
     }
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ENCODE fastmcp Server")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
+    parser.add_argument(
+        "--require-api-key",
+        action="store_true",
+        default=False,
+        help="Require ENCODE_SERVER_API_KEY env var for tool access",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    logger.info("Starting ENCODE fastmcp Server...")
-    logger.info(f"Work directory: {WORK_DIR}")
-    logger.info(f"Cache directory: {CACHE_DIR}")
-    logger.info(f"Files directory: {FILES_DIR}")
-    logger.info("Server running on stdio transport for MCP clients")
-    
+    args = _parse_args()
+
+    if args.require_api_key:
+        _REQUIRE_API_KEY = True  # noqa: F841 – module-level override
+
+    logger.info("Starting ENCODE fastmcp Server v%s ...", __version__)
+    logger.info("Work directory: %s", WORK_DIR)
+    logger.info("Cache directory: %s", CACHE_DIR)
+    logger.info("Files directory: %s", FILES_DIR)
+    logger.info("Auth required: %s", _REQUIRE_API_KEY)
+
     # Run the fastmcp server on HTTP
-    server.run(transport="http", host="0.0.0.0", port=8080)
+    server.run(transport="http", host=args.host, port=args.port)
