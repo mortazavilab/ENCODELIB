@@ -6,8 +6,8 @@
 
 ## 🚀 Quick overview
 
-- **Library:** `encodeLib.py` provides `ENCODE` and `encodeExperiment` classes for searching experiments, retrieving metadata, and organizing/downloading files from ENCODE.
-- **Server:** `encode_server.py` exposes the library via `fastmcp` tools and runs on `http://127.0.0.1:8080`.
+- **Library:** `encodeLib.py` provides `ENCODE` and `encodeExperiment` classes for searching experiments, retrieving metadata, and organizing/downloading files from ENCODE. Includes retry logic with exponential backoff and parallel file downloads.
+- **Server:** `encode_server.py` exposes the library via `fastmcp` tools and runs on `http://127.0.0.1:8080`. Supports optional API key authentication.
 - **Docs:** `encodeLib.md` contains full usage docs for the library. `SERVER_README.md` documents server tools and configuration in detail.
 
 ---
@@ -52,6 +52,13 @@ encode = ENCODE()                      # loads experiments (uses cache)
 hits = encode.search_experiments_by_biosample('K562', assay_title='TF ChIP-seq')
 exp = encode.getExperiment('ENCSR000CDC')
 print(exp.get_file_types())
+
+# Look up an experiment from a file accession (works for any ENCFF)
+exp = encode.search_experiments_by_file_accession('ENCFF001RJK')
+
+# Get metadata / download URL for any file (experiment files, genome refs, etc.)
+meta = encode.get_file_metadata('ENCFF001RJK')
+url  = encode.get_file_url('ENCFF001RJK')
 ```
 
 See `encodeLib.md` for comprehensive examples and API docs (search, file discovery, caching, downloads).
@@ -73,7 +80,7 @@ python3 encode_server.py
 fastmcp run encode_server.py
 ```
 
-The server exposes tools such as `search_by_biosample`, `search_by_target`, `get_files_by_type`, `download_files`, and cache management utilities — see `SERVER_README.md` for details and examples.
+The server exposes tools such as `search_by_biosample`, `search_by_target`, `get_files_by_type`, `download_files`, and the new file-accession tools `search_by_file_accession`, `get_file_metadata_by_accession`, and `get_file_url_by_accession` — see `SERVER_README.md` for details and examples.
 
 ---
 

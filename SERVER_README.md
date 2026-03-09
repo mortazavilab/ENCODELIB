@@ -1,15 +1,17 @@
 # ENCODE fastmcp Server
 
-A fastmcp server exposing the ENCODE library functionality on `http://0.0.0.0:8080`.
+A fastmcp server exposing the ENCODE library functionality on `http://127.0.0.1:8080`.
 
 ## Features
 
 - **Search experiments** by biosample or target
+- **Look up experiments and files by file accession** — works for any ENCFF file, including genome references and annotations
 - **Retrieve experiment metadata** and file information
 - **Organize files** by type, output category, or output type
-- **Download files** automatically (with duplicate detection)
+- **Download files** automatically with parallel workers and duplicate detection
 - **Local caching** for fast repeated access
 - **Metadata caching** by experiment type prefix
+- **Optional API key authentication** for secure deployments
 
 ## Installation
 
@@ -42,6 +44,21 @@ chmod +x start-server.sh
 python3 encode_server.py
 ```
 
+Optional flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address |
+| `--port` | `8080` | Port |
+| `--require-api-key` | off | Enforce API key auth |
+
+Example — bind to all interfaces on port 9000 with auth:
+
+```bash
+export ENCODE_SERVER_API_KEY=mysecretkey
+python3 encode_server.py --host 0.0.0.0 --port 9000 --require-api-key
+```
+
 ### Option 3: Using fastmcp CLI
 
 ```bash
@@ -49,6 +66,16 @@ fastmcp run encode_server.py
 ```
 
 The server will start on `http://127.0.0.1:8080`.
+
+## Authentication
+
+By default the server requires no authentication (suitable for local use). To enable API key protection:
+
+1. Set the key in the environment: `export ENCODE_SERVER_API_KEY=<your-key>`
+2. Start the server with `--require-api-key`
+3. Clients must pass the key as the `api_key` parameter on every tool call.
+
+For production deployments, place the server behind a reverse proxy (nginx / Caddy) to add TLS.
 
 ## Directory Structure
 
@@ -207,7 +234,7 @@ Get summary view of files by type.
 ### File Metadata Tools
 
 #### `get_file_metadata`
-Get comprehensive metadata for a specific file.
+Get comprehensive metadata for a specific file within a known experiment.
 
 **Parameters:**
 - `accession` (str, required): Experiment accession
@@ -216,13 +243,46 @@ Get comprehensive metadata for a specific file.
 **Returns:** Complete file metadata dictionary
 
 #### `get_file_url`
-Get download URL for a specific file.
+Get download URL for a specific file within a known experiment.
 
 **Parameters:**
 - `accession` (str, required): Experiment accession
 - `file_accession` (str, required): File accession ID
 
 **Returns:** Dictionary with download URL
+
+### File-Accession Tools (no experiment required)
+
+These tools work with any ENCODE file accession — experiment files, genome references, annotations, and any other ENCODE dataset type.
+
+#### `search_by_file_accession`
+Find the parent experiment for a given file accession.
+
+**Parameters:**
+- `file_accession` (str, required): ENCODE file accession (e.g., `'ENCFF001RJK'`)
+
+**Returns:** Experiment metadata dict, or `{"experiment": null, "message": "..."}` when the file belongs to a non-experiment dataset (genome reference, annotation, etc.)
+
+**Example:**
+```json
+{ "file_accession": "ENCFF001RJK" }
+```
+
+#### `get_file_metadata_by_accession`
+Get full metadata for any ENCODE file using only its file accession.
+
+**Parameters:**
+- `file_accession` (str, required): ENCODE file accession
+
+**Returns:** Complete file metadata dict (same as the ENCODE `/files/{accession}/` API response)
+
+#### `get_file_url_by_accession`
+Get the download URL for any ENCODE file using only its file accession.
+
+**Parameters:**
+- `file_accession` (str, required): ENCODE file accession
+
+**Returns:** `{ "file_accession": "...", "url": "https://www.encodeproject.org/..." }`
 
 ### Download Tools
 
@@ -316,6 +376,34 @@ Parameters:
   file_types: ["fastq"]
 ```
 
+Downloads run in parallel (4 workers by default) and skip files that already exist locally.
+
+### Look up an experiment from a file accession
+
+```
+Tool: search_by_file_accession
+Parameters:
+  file_accession: "ENCFF001RJK"
+```
+
+### Get metadata for any file (no experiment needed)
+
+```
+Tool: get_file_metadata_by_accession
+Parameters:
+  file_accession: "ENCFF001RJK"
+```
+
+Works for genome references, annotations, and any other ENCODE file type.
+
+### Get download URL for any file
+
+```
+Tool: get_file_url_by_accession
+Parameters:
+  file_accession: "ENCFF001RJK"
+```
+
 ### Check cache status
 
 ```
@@ -367,6 +455,7 @@ The test suite validates:
 - ✅ **MCP Protocol Compliance** — Proper JSON-RPC 2.0 request/response handling
 - ✅ **Session Management** — Session initialization and ID handling via MCP headers
 - ✅ **Tool Execution** — Core tools (`get_server_info`, `list_experiments`, `get_experiment`, `search_by_biosample`)
+- ✅ **File-Accession Tools** — `search_by_file_accession`, `get_file_metadata_by_accession`, `get_file_url_by_accession`
 - ✅ **Response Parsing** — Server-Sent Events (SSE) response format and result extraction
 - ✅ **Data Integrity** — Returned metadata contains required fields (accession, organism, assay, biosample)
 - ✅ **Error Handling** — Graceful handling of invalid accessions and server errors
