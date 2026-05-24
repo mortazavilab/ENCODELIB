@@ -5,11 +5,14 @@ A fastmcp server exposing the ENCODE library functionality on `http://127.0.0.1:
 ## Features
 
 - **Search experiments** by biosample or target
+- **Run batch searches and facet summaries** for LLM-friendly result aggregation
 - **Look up experiments and files by file accession** — works for any ENCFF file, including genome references and annotations
 - **Retrieve experiment metadata** and file information
 - **Organize files** by type, output category, or output type
-- **Download files** automatically with parallel workers and duplicate detection
+- **Download files** automatically with parallel workers, resumable partial transfers, checksum verification, and preview manifests
 - **Local caching** for fast repeated access
+- **Optional eager / lazy / incremental loading modes** for the shared ENCODE instance
+- **Optional in-memory search index** for repeated search acceleration
 - **Metadata caching** by experiment type prefix
 - **Optional API key authentication** for secure deployments
 
@@ -50,13 +53,17 @@ Optional flags:
 |---|---|---|
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8080` | Port |
+| `--load-mode` | `eager` | ENCODE loading strategy: `eager`, `lazy`, or `incremental` |
+| `--incremental-batch-size` | `250` | Batch size for incremental materialization |
+| `--build-search-index` | off | Build the optional in-memory search index on startup |
+| `--enable-metrics` | off | Enable lightweight request/cache metrics |
 | `--require-api-key` | off | Enforce API key auth |
 
 Example — bind to all interfaces on port 9000 with auth:
 
 ```bash
 export ENCODE_SERVER_API_KEY=mysecretkey
-python3 encode_server.py --host 0.0.0.0 --port 9000 --require-api-key
+python3 encode_server.py --host 0.0.0.0 --port 9000 --load-mode incremental --build-search-index --require-api-key
 ```
 
 ### Option 3: Using fastmcp CLI
@@ -139,6 +146,22 @@ Search for experiments by transcription factor or histone mark target.
   "organism": "Homo sapiens"
 }
 ```
+
+#### `search_batch`
+Run multiple biosample / organism / target searches in one tool call.
+
+**Parameters:**
+- `queries` (list[dict], required): Query specs with `mode` (`biosample`, `organism`, or `target`), `value`, and optional `name`, `organism`, `assay_title`, `target`, `exclude_revoked`
+
+**Returns:** Dictionary keyed by query name with search result lists
+
+#### `get_experiment_facets`
+Get aggregate counts for common experiment fields.
+
+**Parameters:**
+- `fields` (list[str], optional): Any of `assay_title`, `biosample_summary`, `organism`, `status`, `target`
+
+**Returns:** Dictionary of `{field: {value: count}}`
 
 ### Experiment Tools
 
@@ -293,8 +316,11 @@ Download files from an experiment to `./files/{accession}/`
 - `accession` (str, required): Experiment accession
 - `file_types` (list[str], optional): Specific file types to download
 - `file_accessions` (list[str], optional): Specific file accessions to download
+- `resume` (bool, optional): Resume partial `.tmp` downloads when possible
+- `verify_checksum` (bool, optional): Verify ENCODE MD5 after download
+- `preview_only` (bool, optional): Return a manifest without downloading files
 
-**Returns:** Download result with lists of downloaded, failed, and skipped files
+**Returns:** Download result with lists of downloaded, failed, and skipped files, plus a `manifest`
 
 **Example:**
 ```json
@@ -314,6 +340,23 @@ Get statistics about the metadata cache.
 - `total_cached_experiments`: Number of cached experiment metadata files
 - `cache_size_mb`: Total cache size in MB
 - `type_prefixes`: Count of cached experiments per type prefix
+- `summary_cache_file`: Path to the experiment summaries cache file
+- `summary_cache_exists`: Whether the summary cache is present
+
+#### `rebuild_search_index`
+Build or rebuild the optional in-memory search index.
+
+**Returns:** Confirmation message plus index stats
+
+#### `get_search_index_stats`
+Get statistics about the optional search index.
+
+**Returns:** Dictionary with `built`, `summary_count`, and per-field stats
+
+#### `get_performance_stats`
+Get performance metrics collected by the library instance.
+
+**Returns:** Dictionary with request/cache/index metrics
 
 #### `clear_cache`
 Clear caches.
@@ -337,7 +380,17 @@ List loaded experiments with pagination.
 #### `get_server_info`
 Get server configuration information.
 
-**Returns:** Dictionary with server settings
+**Returns:** Dictionary with server settings including `load_mode`, `incremental_batch_size`, `build_index_enabled`, and `metrics_enabled`
+
+#### `export_experiments`
+Export all experiments or a filtered search result to JSON, CSV, or TSV.
+
+**Parameters:**
+- `filepath` (str, required): Destination path
+- `format` (str, default: `json`): `json`, `csv`, or `tsv`
+- `search_mode` / `search_value` (optional): Filter before export using `biosample`, `organism`, or `target`
+
+**Returns:** Output path, format, and exported row count
 
 ## Resources
 
@@ -402,6 +455,20 @@ Works for genome references, annotations, and any other ENCODE file type.
 Tool: get_file_url_by_accession
 Parameters:
   file_accession: "ENCFF001RJK"
+```
+
+### Batch file lookup
+
+```
+Tool: get_file_metadata_batch_by_accession
+Parameters:
+  file_accessions: ["ENCFF001RJK", "ENCFF002ABC"]
+```
+
+```
+Tool: search_by_file_accession_batch
+Parameters:
+  file_accessions: ["ENCFF001RJK", "ENCFF002ABC"]
 ```
 
 ### Check cache status

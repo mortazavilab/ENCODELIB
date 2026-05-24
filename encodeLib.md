@@ -19,6 +19,14 @@
 
 The `ENCODE` class provides access to all experiments in the ENCODE database with caching support and comprehensive search functionality.
 
+### v0.4 Highlights
+
+- Optional loading modes: `eager` (default), `lazy`, and `incremental`
+- Incremental summary loading with optional batch materialization
+- Optional search index with reusable summary-backed search paths
+- Batch search helpers, facet summaries, exports, and performance stats
+- Batch file-accession helpers plus preview/resume/checksum-aware downloads
+
 ### Initialization
 
 ```python
@@ -35,6 +43,12 @@ encode = ENCODE(use_cache=False)
 
 # Use custom cache directory
 encode = ENCODE(cache_dir='/path/to/custom/cache')
+
+# Opt into lazy loading without changing the default API
+encode = ENCODE(load_mode='lazy')
+
+# Keep only summaries in memory until batches are explicitly loaded
+encode = ENCODE(load_mode='incremental', incremental_batch_size=250, build_index=True)
 ```
 
 ### Attributes
@@ -45,9 +59,46 @@ encode = ENCODE(cache_dir='/path/to/custom/cache')
 | `base_url` | str | Base URL for ENCODE API (https://www.encodeproject.org) |
 | `cache_dir` | Path | Directory where experiments are cached |
 | `cache_file` | Path | Path to the cache JSON file |
+| `summary_cache_file` | Path | Path to the experiment summaries cache |
 | `use_cache` | bool | Whether caching is enabled |
+| `load_mode` | str | `eager`, `lazy`, or `incremental` |
 
 ### Methods
+
+#### Loading / Index Helpers
+
+```python
+# Load lightweight summaries without materializing full experiments
+summaries = encode.get_experiment_summaries()
+
+# Materialize the next batch of experiments in incremental mode
+batch = encode.load_next_experiment_batch(batch_size=100)
+
+# Build and inspect the optional search index
+encode.build_search_index()
+stats = encode.get_search_index_stats()
+```
+
+#### Batch Search / Facets / Export
+
+```python
+results = encode.search_experiments_batch([
+    {'name': 'k562', 'mode': 'biosample', 'value': 'K562'},
+    {'name': 'ctcf', 'mode': 'target', 'value': 'CTCF'},
+], return_objects=False)
+
+facets = encode.get_experiment_facets(['assay_title', 'organism', 'target'])
+encode.export_experiments('experiments.csv', format='csv')
+stats = encode.get_performance_stats()
+```
+
+#### Batch File Helpers
+
+```python
+metadata = encode.get_file_metadata_batch(['ENCFF001RJK', 'ENCFF002ABC'])
+urls = encode.get_file_url_batch(['ENCFF001RJK', 'ENCFF002ABC'])
+experiments = encode.search_experiments_by_file_accessions(['ENCFF001RJK'])
+```
 
 #### `search_experiments_by_biosample()`
 

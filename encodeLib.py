@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
 import logging
 import os
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -13,9 +16,47 @@ import pandas as pd
 import requests
 
 
-__version__ = "0.3"
+__version__ = "0.4"
 
 logger = logging.getLogger(__name__)
+
+
+class ENCODEError(Exception):
+    """Base exception for ENCODELIB errors."""
+
+
+class ENCODEAPIError(ENCODEError):
+    """Raised when the ENCODE API returns an unexpected or unusable response."""
+
+
+class ENCODEValidationError(ENCODEError):
+    """Raised when ENCODE data or caller input fails validation."""
+
+
+class ENCODEDownloadError(ENCODEError):
+    """Raised when file download verification fails."""
+
+
+_METRICS_ENABLED = False
+_GLOBAL_METRICS: dict[str, float | int] = {
+    "http_requests": 0,
+    "http_retries": 0,
+    "http_failures": 0,
+    "http_latency_seconds": 0.0,
+}
+
+
+def _set_metrics_enabled(enabled: bool) -> None:
+    """Enable or disable lightweight global request metrics collection."""
+    global _METRICS_ENABLED
+    _METRICS_ENABLED = enabled
+
+
+def _record_metric(name: str, value: int | float = 1) -> None:
+    """Record a metric when collection is enabled."""
+    if not _METRICS_ENABLED:
+        return
+    _GLOBAL_METRICS[name] = _GLOBAL_METRICS.get(name, 0) + value
 
 # ---------------------------------------------------------------------------
 # HTTP helper with retry + exponential backoff
@@ -34,6 +75,7 @@ def _request_with_retry(
     timeout: int = 30,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     stream: bool = False,
+    headers: Optional[dict[str, str]] = None,
 ) -> requests.Response:
     """HTTP GET with exponential-backoff retry on transient failures.
 
@@ -42,10 +84,20 @@ def _request_with_retry(
     """
     last_exc: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
+        started_at = time.perf_counter()
         try:
-            response = requests.get(url, params=params, timeout=timeout, stream=stream)
+            _record_metric("http_requests")
+            response = requests.get(
+                url,
+                params=params,
+                timeout=timeout,
+                stream=stream,
+                headers=headers,
+            )
+            _record_metric("http_latency_seconds", time.perf_counter() - started_at)
             if response.status_code in _RETRYABLE_STATUS_CODES and attempt < max_retries:
                 wait = _DEFAULT_BACKOFF_BASE * (2 ** (attempt - 1))
+                _record_metric("http_retries")
                 logger.warning(
                     "Retryable HTTP %s from %s – retry %d/%d in %.1fs",
                     response.status_code, url, attempt, max_retries, wait,
@@ -56,16 +108,21 @@ def _request_with_retry(
             return response
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
             last_exc = exc
+            _record_metric("http_latency_seconds", time.perf_counter() - started_at)
             if attempt < max_retries:
                 wait = _DEFAULT_BACKOFF_BASE * (2 ** (attempt - 1))
+                _record_metric("http_retries")
                 logger.warning(
                     "%s for %s – retry %d/%d in %.1fs",
                     type(exc).__name__, url, attempt, max_retries, wait,
                 )
                 time.sleep(wait)
             else:
+                _record_metric("http_failures")
                 raise
         except requests.exceptions.HTTPError:
+            _record_metric("http_latency_seconds", time.perf_counter() - started_at)
+            _record_metric("http_failures")
             raise  # non-retryable HTTP errors bubble immediately
     # Should not be reached, but satisfy type checkers
     raise last_exc  # type: ignore[misc]
@@ -135,7 +192,7 @@ class encodeExperiment:
         
         # Try to get from encode_obj's experiments list
         if self.encode_obj:
-            for exp in self.encode_obj.experiments:
+            for exp in self.encode_obj.get_loaded_experiments():
                 if exp.get('accession') == self.accession:
                     self.experiment_data = exp
                     # Cache this data
@@ -694,11 +751,78 @@ class encodeExperiment:
             self.experiment_data = None
         
         return True
+
+    def _calculate_md5(self, file_path: Path) -> str:
+        """Calculate the MD5 digest for a local file."""
+        digest = hashlib.md5()
+        with open(file_path, 'rb') as handle:
+            for chunk in iter(lambda: handle.read(8192), b''):
+                if chunk:
+                    digest.update(chunk)
+        return digest.hexdigest()
+
+    def _select_files_to_download(
+        self,
+        file_types: Optional[str | list[str]] = None,
+        accessions: Optional[str | list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Return the file objects selected for a download or manifest request."""
+        files_by_type = self.get_files_by_type()
+
+        if file_types is not None and isinstance(file_types, str):
+            file_types = [file_types]
+        if accessions is not None and isinstance(accessions, str):
+            accessions = [accessions]
+
+        files_to_download: list[dict[str, Any]] = []
+        if accessions:
+            for files in files_by_type.values():
+                for file_obj in files:
+                    if file_obj.get('accession') in accessions:
+                        files_to_download.append(file_obj)
+        elif file_types:
+            for file_type in file_types:
+                if file_type in files_by_type:
+                    files_to_download.extend(files_by_type[file_type])
+        else:
+            for files in files_by_type.values():
+                files_to_download.extend(files)
+
+        return files_to_download
+
+    def prepare_download_manifest(
+        self,
+        file_types: Optional[str | list[str]] = None,
+        accessions: Optional[str | list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Prepare a manifest for files selected for download."""
+        self._ensure_full_data()
+        manifest = []
+        for file_obj in self._select_files_to_download(file_types=file_types, accessions=accessions):
+            href = file_obj.get('href')
+            manifest.append(
+                {
+                    'accession': file_obj.get('accession'),
+                    'filename': file_obj.get('filename'),
+                    'file_type': file_obj.get('file_type'),
+                    'file_format': file_obj.get('file_format'),
+                    'file_size': file_obj.get('file_size'),
+                    'status': file_obj.get('status'),
+                    'output_type': file_obj.get('output_type'),
+                    'output_category': file_obj.get('output_category'),
+                    'md5sum': file_obj.get('md5sum'),
+                    'url': f"https://www.encodeproject.org{href}" if href and not href.startswith('http') else href,
+                }
+            )
+        return manifest
     
     def _download_single_file(
         self,
         file_obj: dict[str, Any],
         output_path: Path,
+        *,
+        resume: bool = False,
+        verify_checksum: bool = False,
     ) -> tuple[str, str, Optional[str]]:
         """Download a single file. Returns (accession, status, error_or_None).
 
@@ -723,9 +847,17 @@ class encodeExperiment:
 
         file_path = output_path / filename
 
+        expected_md5 = file_obj.get('md5sum') or file_obj.get('content_md5sum')
+
         # Skip existing files
         if file_path.exists():
-            return (accession, 'skipped', None)
+            if verify_checksum and expected_md5:
+                existing_md5 = self._calculate_md5(file_path)
+                if existing_md5 == expected_md5:
+                    return (accession, 'skipped', None)
+                file_path.unlink()
+            else:
+                return (accession, 'skipped', None)
 
         url = file_obj.get('href')
         if not url:
@@ -735,14 +867,35 @@ class encodeExperiment:
 
         temp_path = output_path / f"{filename}.tmp"
         try:
-            response = _request_with_retry(url, timeout=300, stream=True)
+            headers = None
+            write_mode = 'wb'
             file_size = 0
-            with open(temp_path, 'wb') as f:
+            if resume and temp_path.exists():
+                file_size = temp_path.stat().st_size
+                if file_size > 0:
+                    headers = {'Range': f'bytes={file_size}-'}
+                    write_mode = 'ab'
+
+            response = _request_with_retry(url, timeout=300, stream=True, headers=headers)
+            if write_mode == 'ab' and getattr(response, 'status_code', 200) != 206:
+                write_mode = 'wb'
+                file_size = 0
+
+            with open(temp_path, write_mode) as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
                         file_size += len(chunk)
             temp_path.rename(file_path)
+
+            if verify_checksum and expected_md5:
+                actual_md5 = self._calculate_md5(file_path)
+                if actual_md5 != expected_md5:
+                    file_path.unlink(missing_ok=True)
+                    raise ENCODEDownloadError(
+                        f"Checksum mismatch for {accession}: expected {expected_md5}, got {actual_md5}"
+                    )
+
             logger.info("Downloaded %s (%s, %s bytes)", accession, filename, f"{file_size:,}")
             return (accession, 'downloaded', None)
         except Exception as exc:
@@ -756,6 +909,9 @@ class encodeExperiment:
         file_types: Optional[str | list[str]] = None,
         accessions: Optional[str | list[str]] = None,
         max_workers: int = 4,
+        resume: bool = False,
+        verify_checksum: bool = False,
+        preview_only: bool = False,
     ) -> dict[str, Any]:
         """
         Download files from this experiment to a local directory.
@@ -770,6 +926,9 @@ class encodeExperiment:
         - accessions: str or list of str specifying specific file accessions to download (e.g., 'ENCFF001JZK')
                       Takes precedence over file_types if both specified
         - max_workers: Maximum number of parallel downloads (default: 4)
+        - resume: Resume partial downloads from `.tmp` files when the server supports range requests.
+        - verify_checksum: Verify the downloaded file MD5 against ENCODE metadata when available.
+        - preview_only: Return a manifest of matching files without downloading them.
         
         Returns:
         - Dictionary with download results:
@@ -801,34 +960,16 @@ class encodeExperiment:
         # Create output directory
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Get all files by type
-        files_by_type = self.get_files_by_type()
-        
-        # Normalize inputs
-        if file_types is not None and isinstance(file_types, str):
-            file_types = [file_types]
-        if accessions is not None and isinstance(accessions, str):
-            accessions = [accessions]
-        
-        # Collect files to download
-        files_to_download: list[dict[str, Any]] = []
-        
-        if accessions:
-            # Download specific accessions
-            for file_type, files in files_by_type.items():
-                for file_obj in files:
-                    if file_obj.get('accession') in accessions:
-                        files_to_download.append(file_obj)
-        elif file_types:
-            # Download specific file types
-            for file_type in file_types:
-                if file_type in files_by_type:
-                    files_to_download.extend(files_by_type[file_type])
-        else:
-            # Download all files
-            for file_type, files in files_by_type.items():
-                files_to_download.extend(files)
+        files_to_download = self._select_files_to_download(file_types=file_types, accessions=accessions)
+
+        if preview_only:
+            return {
+                'downloaded': [],
+                'failed': [],
+                'skipped': [],
+                'output_dir': str(output_path),
+                'manifest': self.prepare_download_manifest(file_types=file_types, accessions=accessions),
+            }
         
         downloaded: list[str] = []
         failed: list[tuple[str, str]] = []
@@ -838,7 +979,13 @@ class encodeExperiment:
         
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
-                pool.submit(self._download_single_file, fobj, output_path): fobj
+                pool.submit(
+                    self._download_single_file,
+                    fobj,
+                    output_path,
+                    resume=resume,
+                    verify_checksum=verify_checksum,
+                ): fobj
                 for fobj in files_to_download
             }
             for future in as_completed(futures):
@@ -865,7 +1012,8 @@ class encodeExperiment:
             'downloaded': downloaded,
             'failed': failed,
             'skipped': skipped,
-            'output_dir': str(output_path)
+            'output_dir': str(output_path),
+            'manifest': self.prepare_download_manifest(file_types=file_types, accessions=accessions),
         }
 
 
@@ -875,9 +1023,19 @@ class ENCODE:
     BASE_URL = "https://www.encodeproject.org"
     CACHE_DIR = Path.home() / ".encode_cache"
     CACHE_FILE = CACHE_DIR / "experiments.json"
+    SUMMARY_CACHE_FILE = CACHE_DIR / "experiment_summaries.json"
     METADATA_CACHE_DIR = CACHE_DIR / "metadata"  # Hierarchical cache for individual experiment metadata
     
-    def __init__(self, use_cache: bool = True, force_refresh: bool = False, cache_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        use_cache: bool = True,
+        force_refresh: bool = False,
+        cache_dir: Optional[str] = None,
+        load_mode: str = "eager",
+        incremental_batch_size: int = 250,
+        build_index: bool = False,
+        enable_metrics: bool = False,
+    ) -> None:
         """
         Initialize ENCODE object by loading all experiments from the ENCODE database.
         
@@ -885,7 +1043,21 @@ class ENCODE:
         - use_cache: Use cached experiments if available (default: True)
         - force_refresh: Force downloading from API, ignore cache (default: False)
         - cache_dir: Custom cache directory (default: ~/.encode_cache)
+        - load_mode: Loading strategy for the experiments list.
+                     'eager' loads at initialization (default).
+                     'lazy' defers loading until experiments are accessed.
+                     'incremental' keeps lightweight summaries in memory and
+                     materializes full experiment data only when explicitly loaded.
+        - incremental_batch_size: Default number of experiment summaries to
+                                  materialize per batch in incremental mode.
+        - build_index: Build the optional search index during initialization.
+        - enable_metrics: Enable lightweight request and cache metrics collection.
         """
+        if load_mode not in {"eager", "lazy", "incremental"}:
+            raise ValueError(f"Unsupported load_mode: {load_mode}")
+        if incremental_batch_size < 1:
+            raise ValueError("incremental_batch_size must be >= 1")
+
         self.base_url = self.BASE_URL
         self.url = f"{self.base_url}/experiments/"
         self.query_params: dict[str, str] = {
@@ -894,21 +1066,389 @@ class ENCODE:
         }
         self.use_cache = use_cache
         self.force_refresh = force_refresh
+        self.load_mode = load_mode
+        self.incremental_batch_size = incremental_batch_size
+        self.enable_metrics = enable_metrics
+        if enable_metrics:
+            _set_metrics_enabled(True)
         
         # Set cache file location
         if cache_dir:
             self.cache_dir = Path(cache_dir)
             self.cache_file = self.cache_dir / "experiments.json"
+            self.summary_cache_file = self.cache_dir / "experiment_summaries.json"
             self.metadata_cache_dir = self.cache_dir / "metadata"
         else:
             self.cache_dir = self.CACHE_DIR
             self.cache_file = self.CACHE_FILE
+            self.summary_cache_file = self.SUMMARY_CACHE_FILE
             self.metadata_cache_dir = self.METADATA_CACHE_DIR
         
         # In-memory cache for file-accession lookups (file_accession -> API response)
         self._file_info_cache: dict[str, dict[str, Any]] = {}
-        
-        self.experiments: list[dict[str, Any]] = self._load_experiments()
+        self._experiments: list[dict[str, Any]] = []
+        self._experiments_loaded = False
+        self._experiment_summaries: list[dict[str, Any]] = []
+        self._summary_lookup: dict[str, dict[str, Any]] = {}
+        self._search_index: Optional[dict[str, dict[str, set[str]]]] = None
+        self._incremental_offset = 0
+        self._instance_metrics: dict[str, int] = {
+            "summary_cache_hits": 0,
+            "summary_cache_misses": 0,
+            "metadata_cache_hits": 0,
+            "metadata_cache_misses": 0,
+            "search_calls": 0,
+            "batch_search_calls": 0,
+            "exports": 0,
+        }
+
+        if self.load_mode == "eager":
+            self.load_all_experiments()
+        elif self.load_mode == "incremental":
+            self.load_experiment_summaries()
+
+        if build_index:
+            self.build_search_index()
+
+    @property
+    def experiments(self) -> list[dict[str, Any]]:
+        """Return the loaded experiments, fetching them first in lazy mode."""
+        self._ensure_experiments_loaded()
+        return self._experiments
+
+    @experiments.setter
+    def experiments(self, value: list[dict[str, Any]]) -> None:
+        self._experiments = value
+        self._experiments_loaded = True
+
+    def _ensure_experiments_loaded(self) -> None:
+        """Load the experiments list on first access when running in lazy mode."""
+        if getattr(self, "_experiments_loaded", False):
+            return
+
+        if getattr(self, "load_mode", "eager") in {"lazy", "incremental"}:
+            self.load_all_experiments()
+
+    def load_all_experiments(self) -> list[dict[str, Any]]:
+        """Load and cache the full experiments list, returning the loaded data."""
+        self._experiments = self._load_experiments()
+        self._experiments_loaded = True
+        self._set_experiment_summaries(self._derive_experiment_summaries(self._experiments))
+        return self._experiments
+
+    def get_loaded_experiments(self) -> list[dict[str, Any]]:
+        """Return only the experiments already loaded in memory.
+
+        Unlike ``experiments``, this never triggers a load. It is used by
+        call sites that should avoid forcing eager-style behavior in lazy mode.
+        """
+        return getattr(self, "_experiments", [])
+
+    def _record_instance_metric(self, name: str, value: int = 1) -> None:
+        """Record a per-instance metric."""
+        if name not in self._instance_metrics:
+            self._instance_metrics[name] = 0
+        self._instance_metrics[name] += value
+
+    def _invalidate_search_index(self) -> None:
+        """Drop the cached search index so it can be rebuilt from fresh data."""
+        self._search_index = None
+
+    def _set_experiment_summaries(self, summaries: list[dict[str, Any]]) -> None:
+        """Update in-memory summary state and invalidate dependent caches."""
+        self._experiment_summaries = summaries
+        self._summary_lookup = {
+            exp["accession"]: exp
+            for exp in summaries
+            if exp.get("accession")
+        }
+        self._incremental_offset = min(self._incremental_offset, len(self._experiment_summaries))
+        self._invalidate_search_index()
+
+    def _derive_experiment_summaries(
+        self,
+        experiments: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Derive lightweight experiment summaries used by lazy/indexed paths."""
+        summaries: list[dict[str, Any]] = []
+        for experiment in experiments:
+            summaries.append(
+                {
+                    "accession": experiment.get("accession"),
+                    "status": experiment.get("status"),
+                    "biosample_summary": experiment.get("biosample_summary", ""),
+                    "biosample_ontology": experiment.get("biosample_ontology", {}),
+                    "assay_title": experiment.get("assay_title", ""),
+                    "target": experiment.get("target"),
+                    "organism": self.get_organism_from_experiment(experiment),
+                    "lab": experiment.get("lab", {}),
+                    "description": experiment.get("description", ""),
+                    "replicates": experiment.get("replicates", []),
+                    "@id": experiment.get("@id", ""),
+                }
+            )
+        return summaries
+
+    def _save_summary_cache(self, summaries: list[dict[str, Any]]) -> None:
+        """Persist experiment summaries to the summary cache file."""
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.summary_cache_file, "w") as handle:
+                json.dump({"experiments": summaries}, handle)
+        except Exception as exc:
+            logger.warning("Could not save summary cache (%s)", exc)
+
+    def _load_summary_cache(self) -> Optional[list[dict[str, Any]]]:
+        """Load experiment summaries from the summary cache file."""
+        if not self.use_cache or not self.summary_cache_file.exists() or self.force_refresh:
+            return None
+
+        try:
+            with open(self.summary_cache_file, "r") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            logger.warning("Could not load summary cache (%s)", exc)
+            return None
+
+        summaries = data.get("experiments", [])
+        if not isinstance(summaries, list):
+            raise ENCODEValidationError("Summary cache must contain an 'experiments' list")
+
+        self._record_instance_metric("summary_cache_hits")
+        return summaries
+
+    def load_experiment_summaries(self, force_refresh: bool = False) -> list[dict[str, Any]]:
+        """Load experiment summaries without materializing the full experiment list."""
+        cached_summaries = None
+        if not force_refresh:
+            cached_summaries = self._load_summary_cache()
+
+        if cached_summaries is not None:
+            self._set_experiment_summaries(cached_summaries)
+            return self._experiment_summaries
+
+        self._record_instance_metric("summary_cache_misses")
+
+        if self.use_cache and not force_refresh and self.cache_file.exists():
+            try:
+                with open(self.cache_file, "r") as handle:
+                    data = json.load(handle)
+                experiments = data.get("experiments", [])
+                if not isinstance(experiments, list):
+                    raise ENCODEValidationError("Experiments cache must contain an 'experiments' list")
+                summaries = self._derive_experiment_summaries(experiments)
+                self._set_experiment_summaries(summaries)
+                self._save_summary_cache(summaries)
+                return summaries
+            except Exception as exc:
+                logger.warning("Could not derive summaries from experiments cache (%s)", exc)
+
+        experiments = self._load_experiments()
+        summaries = self._derive_experiment_summaries(experiments)
+        self._set_experiment_summaries(summaries)
+        if self.use_cache:
+            self._save_summary_cache(summaries)
+        return summaries
+
+    def get_experiment_summaries(self) -> list[dict[str, Any]]:
+        """Return experiment summaries without forcing full experiment materialization."""
+        if self._experiment_summaries:
+            return self._experiment_summaries
+
+        if self._experiments_loaded and self._experiments:
+            self._set_experiment_summaries(self._derive_experiment_summaries(self._experiments))
+            return self._experiment_summaries
+
+        return self.load_experiment_summaries()
+
+    def load_next_experiment_batch(self, batch_size: Optional[int] = None) -> list[dict[str, Any]]:
+        """Materialize the next batch of experiments in incremental mode."""
+        summaries = self.get_experiment_summaries()
+        if not summaries:
+            return []
+
+        batch_size = batch_size or self.incremental_batch_size
+        start = self._incremental_offset
+        end = min(start + batch_size, len(summaries))
+        batch_summaries = summaries[start:end]
+        loaded_accessions = {exp.get("accession") for exp in self._experiments}
+        batch: list[dict[str, Any]] = []
+
+        for summary in batch_summaries:
+            accession = summary.get("accession")
+            if not accession:
+                continue
+            if accession in loaded_accessions:
+                continue
+
+            cached_data = self._load_experiment_metadata(accession)
+            if cached_data is not None:
+                batch.append(cached_data)
+                loaded_accessions.add(accession)
+                continue
+
+            experiment = self.getExperiment(accession)
+            batch.append(experiment.get_all_metadata())
+            loaded_accessions.add(accession)
+
+        self._experiments.extend(batch)
+        self._incremental_offset = end
+        if self._incremental_offset >= len(summaries):
+            self._experiments_loaded = True
+
+        return batch
+
+    def _get_search_source(
+        self,
+        experiments_list: Optional[list[dict[str, Any]]] = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve the dataset used for search without breaking incremental mode."""
+        if experiments_list is not None:
+            return experiments_list
+
+        if self.load_mode == "incremental" and not self._experiments_loaded:
+            return self.get_experiment_summaries()
+
+        return self.experiments
+
+    def build_search_index(self) -> dict[str, dict[str, set[str]]]:
+        """Build an optional in-memory search index over experiment summaries."""
+        summaries = self.get_experiment_summaries()
+        index: dict[str, dict[str, set[str]]] = {
+            "biosample_summary": defaultdict(set),
+            "biosample_term": defaultdict(set),
+            "organism": defaultdict(set),
+            "assay_title": defaultdict(set),
+            "target": defaultdict(set),
+            "status": defaultdict(set),
+        }
+
+        for experiment in summaries:
+            accession = experiment.get("accession")
+            if not accession:
+                continue
+
+            biosample_summary = experiment.get("biosample_summary", "")
+            if biosample_summary:
+                index["biosample_summary"][biosample_summary.lower()].add(accession)
+
+            term_name = experiment.get("biosample_ontology", {}).get("term_name", "")
+            if term_name:
+                index["biosample_term"][term_name.lower()].add(accession)
+
+            organism = self.get_organism_from_experiment(experiment)
+            if organism:
+                index["organism"][organism.lower()].add(accession)
+
+            assay_title = experiment.get("assay_title", "")
+            if assay_title:
+                index["assay_title"][assay_title.lower()].add(accession)
+
+            status = experiment.get("status", "")
+            if status:
+                index["status"][status.lower()].add(accession)
+
+            for target_name in self.get_targets(experiment):
+                if target_name:
+                    index["target"][target_name.lower()].add(accession)
+
+        self._search_index = {
+            field: {key: set(values) for key, values in values_by_key.items()}
+            for field, values_by_key in index.items()
+        }
+        return self._search_index
+
+    def clear_search_index(self) -> None:
+        """Drop the in-memory search index."""
+        self._invalidate_search_index()
+
+    def get_search_index_stats(self) -> dict[str, Any]:
+        """Return lightweight statistics about the optional search index."""
+        if self._search_index is None:
+            return {
+                "built": False,
+                "fields": {},
+                "summary_count": len(self.get_experiment_summaries()),
+            }
+
+        return {
+            "built": True,
+            "summary_count": len(self.get_experiment_summaries()),
+            "fields": {
+                field: {
+                    "unique_terms": len(values),
+                    "accession_links": sum(len(accessions) for accessions in values.values()),
+                }
+                for field, values in self._search_index.items()
+            },
+        }
+
+    def _search_index_matches(
+        self,
+        field: str,
+        search_value: str,
+        *,
+        exact: bool = False,
+    ) -> set[str]:
+        """Resolve accessions from the optional index using exact or substring matching."""
+        if self._search_index is None:
+            return set()
+
+        values = self._search_index.get(field, {})
+        lowered = search_value.lower()
+        if exact:
+            return set(values.get(lowered, set()))
+
+        matches: set[str] = set()
+        for candidate, accessions in values.items():
+            if lowered in candidate:
+                matches.update(accessions)
+        return matches
+
+    def _get_indexed_search_results(
+        self,
+        *,
+        biosample_search: Optional[str] = None,
+        organism: Optional[str] = None,
+        assay_title: Optional[str] = None,
+        target: Optional[str] = None,
+        exclude_revoked: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Use the optional search index to resolve a filtered summary list."""
+        if self._search_index is None:
+            return []
+
+        summaries = self.get_experiment_summaries()
+        all_accessions = set(self._summary_lookup.keys())
+        candidate_sets: list[set[str]] = []
+
+        if biosample_search:
+            biosample_matches = self._search_index_matches("biosample_summary", biosample_search)
+            biosample_matches.update(self._search_index_matches("biosample_term", biosample_search))
+            candidate_sets.append(biosample_matches)
+
+        if organism:
+            candidate_sets.append(self._search_index_matches("organism", organism, exact=True))
+
+        if assay_title:
+            candidate_sets.append(self._search_index_matches("assay_title", assay_title, exact=True))
+
+        if target:
+            candidate_sets.append(self._search_index_matches("target", target))
+
+        if exclude_revoked:
+            candidate_sets.append(all_accessions - self._search_index_matches("status", "revoked", exact=True))
+
+        matched_accessions = all_accessions
+        for candidate_set in candidate_sets:
+            matched_accessions &= candidate_set
+
+        summary_by_accession = self._summary_lookup
+        return [
+            summary_by_accession[accession]
+            for accession in (summary.get("accession") for summary in summaries)
+            if accession in matched_accessions and accession in summary_by_accession
+        ]
     
     def _load_experiments(self) -> list[dict[str, Any]]:
         """Load experiments from cache or ENCODE API"""
@@ -930,6 +1470,8 @@ class ENCODE:
         
         response = _request_with_retry(self.url, params=self.query_params, timeout=120)
         data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get('@graph'), list):
+            raise ENCODEValidationError("ENCODE experiments response did not contain an '@graph' list")
         
         experiments = data.get('@graph', [])
         print(f"✓ Loaded {len(experiments):,} total experiments\n")
@@ -947,6 +1489,7 @@ class ENCODE:
             cache_data = {'experiments': experiments}
             with open(self.cache_file, 'w') as f:
                 json.dump(cache_data, f)
+            self._save_summary_cache(self._derive_experiment_summaries(experiments))
             print(f"✓ Cached experiments to {self.cache_file}\n")
         except Exception as e:
             print(f"Warning: Could not save cache ({e})\n")
@@ -985,6 +1528,7 @@ class ENCODE:
         """
         target_cache = Path(cache_dir) if cache_dir else self.cache_dir
         cache_file = target_cache / "experiments.json"
+        summary_cache_file = target_cache / "experiment_summaries.json"
         
         try:
             if cache_file.exists():
@@ -992,6 +1536,13 @@ class ENCODE:
                 print(f"✓ Cleared cache at {cache_file}")
             else:
                 print(f"Cache file not found at {cache_file}")
+
+            if summary_cache_file.exists():
+                summary_cache_file.unlink()
+
+            self._experiments = []
+            self._experiments_loaded = False
+            self._set_experiment_summaries([])
         except Exception as e:
             raise IOError(f"Could not clear cache: {e}")
     
@@ -1030,8 +1581,7 @@ class ENCODE:
             with open(cache_path, 'w') as f:
                 json.dump(data, f)
         except Exception as e:
-            # Silently fail on cache write - it's not critical
-            pass
+            logger.warning("Could not save experiment metadata for %s (%s)", accession, e)
     
     def _load_experiment_metadata(self, accession: str) -> Optional[dict[str, Any]]:
         """
@@ -1049,11 +1599,13 @@ class ENCODE:
         cache_path = self._get_metadata_cache_path(accession)
         try:
             if cache_path.exists():
+                self._record_instance_metric("metadata_cache_hits")
                 with open(cache_path, 'r') as f:
                     return json.load(f)
-        except Exception:
-            # Silently fail on cache read - fall back to API
-            pass
+        except Exception as exc:
+            logger.warning("Could not load experiment metadata for %s (%s)", accession, exc)
+
+        self._record_instance_metric("metadata_cache_misses")
         
         return None
     
@@ -1131,6 +1683,20 @@ class ENCODE:
         the experiment data loaded (e.g., from _load_experiments).
         """
         return encodeExperiment(experiment_data=experiment_data, encode_obj=self)
+
+    def get_performance_stats(self) -> dict[str, Any]:
+        """Return lightweight performance and cache statistics for this instance."""
+        return {
+            "version": __version__,
+            "load_mode": self.load_mode,
+            "metrics_enabled": _METRICS_ENABLED,
+            "global_http": dict(_GLOBAL_METRICS),
+            "instance_metrics": dict(self._instance_metrics),
+            "loaded_experiments": len(self.get_loaded_experiments()),
+            "loaded_summaries": len(self._experiment_summaries),
+            "incremental_offset": self._incremental_offset,
+            "search_index": self.get_search_index_stats(),
+        }
     
     def getExperiment(self, accession: str) -> encodeExperiment:
         """
@@ -1152,6 +1718,10 @@ class ENCODE:
     
     def get_organism_from_experiment(self, exp: dict[str, Any]) -> Optional[str]:
         """Extract organism scientific name from experiment replicates"""
+        organism = exp.get('organism')
+        if isinstance(organism, str) and organism:
+            return organism
+
         if 'replicates' not in exp or not exp['replicates']:
             return None
         
@@ -1180,6 +1750,10 @@ class ENCODE:
         Returns a list of target labels. For most experiments, there's one target.
         Some experiments may have multiple targets.
         """
+        explicit_targets = experiment.get('targets')
+        if isinstance(explicit_targets, list):
+            return [target for target in explicit_targets if isinstance(target, str) and target]
+
         target_field = experiment.get('target', None)
         
         if not target_field:
@@ -1237,9 +1811,19 @@ class ENCODE:
         Returns:
         - List of encodeExperiment objects or raw experiment dicts
         """
+        self._record_instance_metric("search_calls")
 
-        if experiments_list is None:
-            experiments_list = self.experiments
+        if experiments_list is None and self._search_index is not None:
+            indexed_matches = self._get_indexed_search_results(
+                biosample_search=search_term,
+                organism=organism,
+                assay_title=assay_title,
+                target=target,
+                exclude_revoked=exclude_revoked,
+            )
+            experiments_list = indexed_matches
+        else:
+            experiments_list = self._get_search_source(experiments_list)
         
         search_lower = search_term.lower() if search_term else None
         matching = []
@@ -1281,7 +1865,7 @@ class ENCODE:
         
         # Convert to encodeExperiment objects if requested
         if return_objects:
-            return [encodeExperiment(exp.get('accession'), self) for exp in matching]
+            return [self.create_experiment_object(exp) for exp in matching]
         return matching
     
     def search_experiments_by_biosample(
@@ -1309,9 +1893,19 @@ class ENCODE:
         Returns:
         - List of encodeExperiment objects or raw experiment dicts
         """
-        
-        if experiments_list is None:
-            experiments_list = self.experiments
+        self._record_instance_metric("search_calls")
+
+        if experiments_list is None and self._search_index is not None:
+            indexed_matches = self._get_indexed_search_results(
+                biosample_search=search_term,
+                organism=organism,
+                assay_title=assay_title,
+                target=target,
+                exclude_revoked=exclude_revoked,
+            )
+            experiments_list = indexed_matches
+        else:
+            experiments_list = self._get_search_source(experiments_list)
         
         search_lower = search_term.lower()
 
@@ -1355,7 +1949,7 @@ class ENCODE:
         
         # Convert to encodeExperiment objects if requested
         if return_objects:
-            return [encodeExperiment(exp.get('accession'), self) for exp in matching]
+            return [self.create_experiment_object(exp) for exp in matching]
         return matching
      
     def search_experiments_by_target(
@@ -1381,8 +1975,18 @@ class ENCODE:
         Returns:
         - List of encodeExperiment objects or raw experiment dicts
         """
-        if experiments_list is None:
-            experiments_list = self.experiments
+        self._record_instance_metric("search_calls")
+
+        if experiments_list is None and self._search_index is not None:
+            indexed_matches = self._get_indexed_search_results(
+                organism=organism,
+                assay_title=assay_title,
+                target=target,
+                exclude_revoked=exclude_revoked,
+            )
+            experiments_list = indexed_matches
+        else:
+            experiments_list = self._get_search_source(experiments_list)
         
         target_lower = target.lower()
         matching = []
@@ -1414,8 +2018,174 @@ class ENCODE:
         
         # Convert to encodeExperiment objects if requested
         if return_objects:
-            return [encodeExperiment(exp.get('accession'), self) for exp in matching]
+            return [self.create_experiment_object(exp) for exp in matching]
         return matching
+
+    def search_experiments_batch(
+        self,
+        queries: list[dict[str, Any]],
+        return_objects: bool = True,
+    ) -> dict[str, list[encodeExperiment] | list[dict[str, Any]]]:
+        """Run multiple experiment searches in one call.
+
+        Each query dict should contain a ``mode`` of ``biosample``, ``organism``,
+        or ``target`` plus the corresponding input value.
+        """
+        self._record_instance_metric("batch_search_calls")
+        results: dict[str, list[encodeExperiment] | list[dict[str, Any]]] = {}
+
+        for index, query in enumerate(queries):
+            mode = query.get("mode", "biosample")
+            key = query.get("name") or f"query_{index + 1}"
+
+            if mode == "biosample":
+                search_term = query.get("search_term") or query.get("value")
+                if not search_term:
+                    raise ENCODEValidationError("Batch biosample queries require 'search_term' or 'value'")
+                results[key] = self.search_experiments_by_biosample(
+                    search_term,
+                    organism=query.get("organism"),
+                    assay_title=query.get("assay_title"),
+                    target=query.get("target"),
+                    exclude_revoked=query.get("exclude_revoked", True),
+                    return_objects=return_objects,
+                )
+            elif mode == "organism":
+                organism = query.get("organism") or query.get("value")
+                if not organism:
+                    raise ENCODEValidationError("Batch organism queries require 'organism' or 'value'")
+                results[key] = self.search_experiments_by_organism(
+                    organism,
+                    search_term=query.get("search_term"),
+                    assay_title=query.get("assay_title"),
+                    target=query.get("target"),
+                    exclude_revoked=query.get("exclude_revoked", True),
+                    return_objects=return_objects,
+                )
+            elif mode == "target":
+                target_name = query.get("target") or query.get("value")
+                if not target_name:
+                    raise ENCODEValidationError("Batch target queries require 'target' or 'value'")
+                results[key] = self.search_experiments_by_target(
+                    target_name,
+                    organism=query.get("organism"),
+                    assay_title=query.get("assay_title"),
+                    exclude_revoked=query.get("exclude_revoked", True),
+                    return_objects=return_objects,
+                )
+            else:
+                raise ENCODEValidationError(f"Unsupported batch search mode: {mode}")
+
+        return results
+
+    def get_experiment_facets(
+        self,
+        fields: Optional[list[str]] = None,
+        experiments_list: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, dict[str, int]]:
+        """Return counts for common experiment facets useful in UIs and MCP clients."""
+        source = self._get_search_source(experiments_list)
+        requested_fields = fields or [
+            "assay_title",
+            "biosample_summary",
+            "organism",
+            "status",
+            "target",
+        ]
+        facets: dict[str, dict[str, int]] = {}
+
+        for field in requested_fields:
+            counts: dict[str, int] = defaultdict(int)
+            for experiment in source:
+                if field == "organism":
+                    value = self.get_organism_from_experiment(experiment)
+                    if value:
+                        counts[value] += 1
+                elif field == "target":
+                    for target_name in self.get_targets(experiment):
+                        counts[target_name] += 1
+                else:
+                    value = experiment.get(field)
+                    if isinstance(value, str) and value:
+                        counts[value] += 1
+
+            facets[field] = dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+        return facets
+
+    def _experiment_row_for_export(self, experiment: dict[str, Any] | encodeExperiment) -> dict[str, Any]:
+        """Normalize experiment data for export formats."""
+        if isinstance(experiment, encodeExperiment):
+            return {
+                "accession": experiment.accession,
+                "organism": experiment.organism,
+                "assay_title": experiment.assay,
+                "biosample_summary": experiment.biosample,
+                "lab": experiment.lab,
+                "status": experiment.status,
+                "targets": ", ".join(experiment.targets),
+                "replicate_count": experiment.replicate_count,
+                "description": experiment.description,
+                "link": experiment.link,
+            }
+
+        targets = self.get_targets(experiment)
+        return {
+            "accession": experiment.get("accession"),
+            "organism": self.get_organism_from_experiment(experiment),
+            "assay_title": experiment.get("assay_title"),
+            "biosample_summary": experiment.get("biosample_summary"),
+            "lab": experiment.get("lab", {}).get("title", "Unknown") if isinstance(experiment.get("lab"), dict) else experiment.get("lab"),
+            "status": experiment.get("status"),
+            "targets": ", ".join(targets),
+            "replicate_count": len(experiment.get("replicates", [])),
+            "description": experiment.get("description", ""),
+            "link": f"https://www.encodeproject.org{experiment.get('@id', '')}" if experiment.get("@id") else None,
+        }
+
+    def export_experiments(
+        self,
+        filepath: str,
+        experiments: Optional[list[dict[str, Any]] | list[encodeExperiment]] = None,
+        format: str = "json",
+    ) -> Path:
+        """Export experiments to JSON, CSV, or TSV."""
+        selected_experiments = experiments if experiments is not None else self._get_search_source()
+        rows = [
+            self._experiment_row_for_export(experiment)
+            for experiment in selected_experiments
+        ]
+
+        output_path = Path(filepath)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        normalized_format = format.lower()
+
+        if normalized_format == "json":
+            with open(output_path, "w") as handle:
+                json.dump(rows, handle, indent=2)
+        elif normalized_format in {"csv", "tsv"}:
+            delimiter = "," if normalized_format == "csv" else "\t"
+            fieldnames = [
+                "accession",
+                "organism",
+                "assay_title",
+                "biosample_summary",
+                "lab",
+                "status",
+                "targets",
+                "replicate_count",
+                "description",
+                "link",
+            ]
+            with open(output_path, "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter=delimiter)
+                writer.writeheader()
+                writer.writerows(rows)
+        else:
+            raise ENCODEValidationError(f"Unsupported export format: {format}")
+
+        self._record_instance_metric("exports")
+        return output_path
     
     def get_samples_dataframe(self, organism: Optional[str] = None, assay_type: Optional[list[str]] = None) -> pd.DataFrame:
         """
@@ -1431,7 +2201,7 @@ class ENCODE:
         samples_data = []
         lower_assays = [assay.lower() for assay in assay_type] if assay_type else None
         
-        for exp in self.experiments:
+        for exp in self._get_search_source():
             exp_organism = self.get_organism_from_experiment(exp)
             exp_assay = exp.get('assay_title')
             
@@ -1484,6 +2254,8 @@ class ENCODE:
         url = f"{self.base_url}/files/{file_accession}/"
         response = _request_with_retry(url, params={"format": "json"}, timeout=30)
         data: dict[str, Any] = response.json()
+        if not isinstance(data, dict) or data.get("accession") != file_accession:
+            raise ENCODEValidationError(f"Invalid file metadata returned for {file_accession}")
 
         self._file_info_cache[file_accession] = data
         return data
@@ -1544,6 +2316,13 @@ class ENCODE:
         except (ValueError, requests.exceptions.HTTPError):
             return None
 
+    def get_file_metadata_batch(self, file_accessions: list[str]) -> dict[str, Optional[dict[str, Any]]]:
+        """Get file metadata for multiple ENCODE file accessions."""
+        return {
+            accession: self.get_file_metadata(accession)
+            for accession in file_accessions
+        }
+
     def get_file_url(self, file_accession: str) -> Optional[str]:
         """Get the download URL for any ENCODE file by its accession.
 
@@ -1565,3 +2344,27 @@ class ENCODE:
         if href:
             return f"{self.base_url}{href}"
         return None
+
+    def get_file_url_batch(self, file_accessions: list[str]) -> dict[str, Optional[str]]:
+        """Get download URLs for multiple ENCODE file accessions."""
+        return {
+            accession: self.get_file_url(accession)
+            for accession in file_accessions
+        }
+
+    def search_experiments_by_file_accessions(
+        self,
+        file_accessions: list[str],
+        return_objects: bool = True,
+    ) -> dict[str, Optional[encodeExperiment] | Optional[dict[str, Any]]]:
+        """Resolve multiple file accessions to their parent experiments when available."""
+        results: dict[str, Optional[encodeExperiment] | Optional[dict[str, Any]]] = {}
+        for file_accession in file_accessions:
+            experiment = self.search_experiments_by_file_accession(file_accession)
+            if experiment is None:
+                results[file_accession] = None
+            elif return_objects:
+                results[file_accession] = experiment
+            else:
+                results[file_accession] = experiment.get_all_metadata()
+        return results

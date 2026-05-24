@@ -3,3 +3,11 @@ __pycache__/encodeLib.cpython-311.pyc
 __pycache__/encodeLib.cpython-313.pyc
 tests/__pycache__/test_encodeLib.cpython-313.pyc
 tests/__pycache__/test_encodeLib.cpython-311-pytest-8.4.2.pyc
+__pycache__/encode_server.cpython-311.pyc
+__pycache__/encode_server.cpython-313.pyc
+.gitignore
+tests/__pycache__/test_encode_server_unit.cpython-313.pyc
+tests/__pycache__/test_encodeLib_downloads_unit.cpython-313.pyc
+tests/__pycache__/test_encodeLib_lazy.cpython-313.pyc
+tests/__pycache__/test_encodeLib_queries_unit.cpython-313.pyc
+__pycache__/encodeStream.cpython-313.pyc
